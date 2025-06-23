@@ -1,5 +1,5 @@
-﻿// Tiropa.cpp : Defines the entry point for the application.
-// VERSIÓN SINCRONIZADA CON LINUX - TCP + Mismos tiempos
+﻿// Tiropa.cpp : Juego de tiro parabólico multijugador
+// Sistema de colisiones mejorado: rectángulo vs rectángulo
 
 #include "framework.h"
 #include "Tiropa.h"
@@ -18,83 +18,85 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ws2_32.lib")
 
-// Constants - SINCRONIZADOS CON LINUX
+// Constantes del juego
 #define MAX_LOADSTRING 100
-#define G 9.8f                      // ✅ Igual que Linux
-#define PUERTO_SERVIDOR 4200        // ✅ Igual que Linux
-#define ANCHO_PERSONAJE 50          // ✅ Igual que Linux
-#define ALTO_PERSONAJE 40           // ✅ Igual que Linux
-#define TAM_BOLA 30                 // ✅ Igual que Linux
-#define MAX_ALIAS 32                // ✅ Igual que Linux
-#define MAX_PROYECTILES 10
-#define ANCHO_JUEGO 1080            // ✅ Igual que Linux
-#define ALTO_JUEGO 720              // ✅ Igual que Linux
-#define ALTO_CONTROLES 40
+#define G 9.8f                          // Aceleración gravitacional
+#define PUERTO_SERVIDOR 4200            // Puerto TCP para comunicación
+#define ANCHO_PERSONAJE 50              // Dimensiones del personaje
+#define ALTO_PERSONAJE 40
+#define TAM_BOLA 30                     // Tamaño del proyectil
+#define MAX_ALIAS 32                    // Longitud máxima del nombre
+#define MAX_PROYECTILES 10              // Máximo proyectiles simultáneos
+#define ANCHO_JUEGO 1080                // Área de juego
+#define ALTO_JUEGO 720
+#define ALTO_CONTROLES 40               // Espacio para controles UI
 #define ANCHO_VENTANA (ANCHO_JUEGO + 20)
 #define ALTO_VENTANA (ALTO_JUEGO + ALTO_CONTROLES + 60)
-#define TIMER_INTERVAL 20           // ✅ CAMBIADO: 20ms igual que Linux
-#define TIMEOUT_SEGUNDOS 3
-#define ESCALA_VISUAL 3.0           // ✅ Igual que Linux
-#define VELOCIDAD_VISUAL_CONSTANTE 150.0  // ✅ Igual que Linux
-#define DELTA_T 0.02                // ✅ AGREGADO: Igual que Linux
-#define SLEEP_TIME 20               // ✅ CAMBIADO: 20ms igual que Linux
+#define TIMER_INTERVAL 20               // Intervalo del timer (50 FPS)
+#define TIMEOUT_SEGUNDOS 3              // Timeout de red
+#define ESCALA_VISUAL 3.0               // Factor de escala visual
+#define VELOCIDAD_VISUAL_CONSTANTE 150.0 // Velocidad visual normalizada
+#define DELTA_T 0.02                    // Delta de tiempo para física
 
-// Structures - IDÉNTICAS A LINUX
+// Estructura de datos de red - compatible con otros proyectos
 typedef struct {
-    double x, y, xo, yo;
-    double vo, ang;
-    double to;
-    char NN[MAX_ALIAS];
+    double x, y, xo, yo;                // Posición actual y origen
+    double vo, ang;                     // Velocidad inicial y ángulo
+    double to;                          // Tiempo inicial
+    char NN[MAX_ALIAS];                 // Nombre del jugador
 } Datos;
 
+// Estructura interna del proyectil
 typedef struct {
-    CRITICAL_SECTION mutex;
-    double x, y;
-    double pos_x, pos_y;
-    double vel_x, vel_y;
-    double tiempo_ini;
-    char remitente[MAX_ALIAS];
-    BOOL activo;
-    BOOL es_local;
+    CRITICAL_SECTION mutex;             // Sincronización de hilos
+    double x, y;                        // Posición actual
+    double pos_x, pos_y;                // Posición inicial
+    double vel_x, vel_y;                // Velocidades componentes
+    double tiempo_ini;                  // Tiempo transcurrido
+    char remitente[MAX_ALIAS];          // Quien disparó
+    BOOL activo;                        // Estado del proyectil
+    BOOL es_local;                      // Proyectil propio o remoto
 } DatosProyectil;
 
+// Estructura de las barras del juego
 typedef struct {
-    int x, y, ancho, alto;
-    BOOL visible;
+    int x, y, ancho, alto;              // Dimensiones y posición
+    BOOL visible;                       // Estado de visibilidad
 } BarraJuego;
 
-// Global Variables
+// Variables globales del sistema
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
 WCHAR szWindowClass[MAX_LOADSTRING];
 
+// Variables de red
 SOCKET serverSocket = INVALID_SOCKET;
 BOOL serverActivo = TRUE;
 BOOL aplicacionCerrando = FALSE;
 HWND hWndGlobal = NULL;
 char alias_jugador[MAX_ALIAS] = "jugador1";
 
-// Game area - exactly 1080x720 starting after controls
+// Área de juego
 RECT gameArea = { 10, ALTO_CONTROLES + 10, ANCHO_JUEGO + 10, ALTO_JUEGO + ALTO_CONTROLES + 10 };
 
-// Image resources
+// Recursos gráficos
 HBITMAP hBmpPersonaje = NULL;
 HBITMAP hBmpBola = NULL;
 
-// Character and game elements
+// Estado del personaje
 int personaje_x = 0;
 int personaje_y = 0;
-int personaje_barra_actual = -1;
-BarraJuego barras[3];
+int personaje_barra_actual = -1;        // Índice de barra donde está (-1 = suelo)
+BarraJuego barras[3];                   // Tres barras del juego
 BOOL personaje_destruido = FALSE;
 BOOL tiro_en_progreso = FALSE;
 
-// Projectiles management
+// Sistema de proyectiles
 DatosProyectil proyectiles[MAX_PROYECTILES];
 CRITICAL_SECTION mutex_proyectiles;
 int num_proyectiles = 0;
 
-// UI Elements
+// Controles de interfaz
 HWND hEditVelocidad = NULL;
 HWND hEditAngulo = NULL;
 HWND hEditIP = NULL;
@@ -106,16 +108,16 @@ HDC hMemDC = NULL;
 HBITMAP hMemBitmap = NULL;
 HBITMAP hOldBitmap = NULL;
 
-// Thread handles for proper cleanup
+// Hilo del servidor
 HANDLE hServidorThread = NULL;
 
-// Function prototypes
+// Prototipos de funciones
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 
-// Game functions
+// Funciones del juego
 void InicializarJuego(HWND hWnd);
 void InicializarBarrasAleatorias();
 void PosicionarPersonajeSobreBarraAleatoria();
@@ -126,36 +128,40 @@ void VerificarGravedadPersonaje();
 void LimpiarProyectiles();
 BOOL ValidarDatosEntrada();
 
-// Network functions (TCP - CAMBIADO DE UDP A TCP)
+// Funciones de red TCP
 void EnviarDatosTCP(const char* ipDestino, const Datos* datos);
 DWORD WINAPI ServidorTCPThread(LPVOID param);
 DWORD WINAPI ClienteTCPThread(LPVOID param);
 DWORD WINAPI AtenderClienteThread(LPVOID param);
 void ProcesarDatosRecibidos(const Datos* datos);
 
-// Projectile functions
+// Funciones de proyectiles
 int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, const char* remitente);
 void EliminarProyectil(int index);
 void ActualizarProyectil(int index);
 
-// Utility functions
+// Funciones de utilidad
 void LimpiarRecursos();
 void CerrarAplicacion();
-BOOL Colisiona(double x, double y, const BarraJuego* barra);
+BOOL ColisionaConBarra(double x, double y, const BarraJuego* barra);
+BOOL ColisionaRectangulos(double x1, double y1, double w1, double h1,
+    double x2, double y2, double w2, double h2);
+BOOL ColisionaConPersonaje(double proj_x, double proj_y);
 void FinalizarPartida(const char* remitente);
 
-// Implementation
+// Implementación de funciones
+
+// Inicializa el sistema de juego
 void InicializarJuego(HWND hWnd) {
-    // Initialize critical sections
     InitializeCriticalSection(&mutex_proyectiles);
 
-    // Initialize projectiles array
+    // Inicializar array de proyectiles
     for (int i = 0; i < MAX_PROYECTILES; i++) {
         proyectiles[i].activo = FALSE;
         InitializeCriticalSection(&proyectiles[i].mutex);
     }
 
-    // Load images
+    // Cargar recursos gráficos
     hBmpPersonaje = LoadBitmap(hInst, MAKEINTRESOURCE(IDB_PERSONAJE));
     hBmpBola = LoadBitmap(hInst, MAKEINTRESOURCE(IDB_COMER));
 
@@ -163,24 +169,25 @@ void InicializarJuego(HWND hWnd) {
         MessageBoxA(hWnd, "Error cargando imagenes del juego", "Error", MB_OK | MB_ICONERROR);
     }
 
-    // Initialize game elements
+    // Configurar elementos del juego
     InicializarBarrasAleatorias();
     PosicionarPersonajeSobreBarraAleatoria();
 
-    // Setup double buffering for exact game area
+    // Configurar double buffering
     HDC hdc = GetDC(hWnd);
     hMemDC = CreateCompatibleDC(hdc);
     hMemBitmap = CreateCompatibleBitmap(hdc, ANCHO_JUEGO, ALTO_JUEGO);
     hOldBitmap = (HBITMAP)SelectObject(hMemDC, hMemBitmap);
     ReleaseDC(hWnd, hdc);
 
-    // Start TCP server thread
+    // Iniciar servidor TCP
     hServidorThread = CreateThread(NULL, 0, ServidorTCPThread, hWnd, 0, NULL);
 
-    // Start game timer - SINCRONIZADO CON LINUX (20ms)
+    // Iniciar timer del juego
     SetTimer(hWnd, 1, TIMER_INTERVAL, NULL);
 }
 
+// Genera posiciones aleatorias para las barras
 void InicializarBarrasAleatorias() {
     srand((unsigned int)GetTickCount());
 
@@ -200,6 +207,7 @@ void InicializarBarrasAleatorias() {
     }
 }
 
+// Coloca el personaje sobre una barra aleatoria
 void PosicionarPersonajeSobreBarraAleatoria() {
     if (!hBmpPersonaje) return;
 
@@ -208,42 +216,33 @@ void PosicionarPersonajeSobreBarraAleatoria() {
     // Centrar horizontalmente en la barra
     personaje_x = barras[barraSeleccionada].x + (barras[barraSeleccionada].ancho - ANCHO_PERSONAJE) / 2;
 
-    // Posicionar COMPLETAMENTE encima de la barra con separación
-    personaje_y = barras[barraSeleccionada].y - ALTO_PERSONAJE - 11;
+    // Posicionar encima de la barra con separación
+    personaje_y = barras[barraSeleccionada].y - ALTO_PERSONAJE - 10;
 
-    // Verificar que no se salga del área de juego por arriba
+    // Verificar límites del área de juego
     if (personaje_y < gameArea.top) {
         personaje_y = gameArea.top;
     }
 
-    // Establecer la barra actual
     personaje_barra_actual = barraSeleccionada;
-
-    // Debug: Verificar posiciones
-    char debug[256];
-    sprintf_s(debug, sizeof(debug),
-        "Personaje en barra %d: x=%d, y=%d",
-        barraSeleccionada, personaje_x, personaje_y);
-    OutputDebugStringA(debug);
 }
 
+// Verifica si el personaje debe caer por destrucción de barra
 void VerificarGravedadPersonaje() {
     if (personaje_destruido) return;
 
-    // Si el personaje está asignado a una barra específica
+    // Si está en una barra específica
     if (personaje_barra_actual >= 0 && personaje_barra_actual < 3) {
-        // Verificar si esa barra fue destruida
+        // Verificar si la barra fue destruida
         if (!barras[personaje_barra_actual].visible) {
-            // Posicionar el personaje en el suelo
+            // Hacer caer al suelo
             personaje_y = gameArea.bottom - ALTO_PERSONAJE - 20;
-            personaje_barra_actual = -1;  // Ahora está en el suelo
-
-            // Debug
-            OutputDebugStringA("Personaje cayó al suelo por destrucción de barra");
+            personaje_barra_actual = -1;
         }
     }
 }
 
+// Dibuja un bitmap en el contexto especificado
 void DibujarBitmap(HDC hdcDestino, HBITMAP hBitmap, int x, int y) {
     if (!hBitmap) return;
 
@@ -259,15 +258,16 @@ void DibujarBitmap(HDC hdcDestino, HBITMAP hBitmap, int x, int y) {
     DeleteDC(hdcMem);
 }
 
+// Renderiza todos los elementos del juego
 void DibujarJuego(HDC hdc) {
-    // Clear background with WHITE
+    // Limpiar fondo
     RECT rect = { 0, 0, ANCHO_JUEGO, ALTO_JUEGO };
     HBRUSH hBrushFondo = CreateSolidBrush(RGB(255, 255, 255));
     FillRect(hdc, &rect, hBrushFondo);
     DeleteObject(hBrushFondo);
 
-    // Draw bars
-    HBRUSH hBarBrush = CreateSolidBrush(RGB(76, 76, 255)); // ✅ Color similar a Linux (0.3, 0.3, 1.0)
+    // Dibujar barras
+    HBRUSH hBarBrush = CreateSolidBrush(RGB(76, 76, 255));
     for (int i = 0; i < 3; i++) {
         if (!barras[i].visible) continue;
 
@@ -281,14 +281,14 @@ void DibujarJuego(HDC hdc) {
     }
     DeleteObject(hBarBrush);
 
-    // Draw character
+    // Dibujar personaje
     if (!personaje_destruido && hBmpPersonaje) {
         DibujarBitmap(hdc, hBmpPersonaje,
             personaje_x - gameArea.left,
             personaje_y - gameArea.top);
     }
 
-    // Draw projectiles
+    // Dibujar proyectiles
     EnterCriticalSection(&mutex_proyectiles);
     for (int i = 0; i < MAX_PROYECTILES; i++) {
         if (!proyectiles[i].activo) continue;
@@ -298,6 +298,7 @@ void DibujarJuego(HDC hdc) {
         double y = proyectiles[i].y - gameArea.top;
         LeaveCriticalSection(&proyectiles[i].mutex);
 
+        // Solo dibujar si está en área visible
         if (x >= -TAM_BOLA && x <= ANCHO_JUEGO + TAM_BOLA &&
             y >= -TAM_BOLA && y <= ALTO_JUEGO + TAM_BOLA) {
 
@@ -309,9 +310,11 @@ void DibujarJuego(HDC hdc) {
     LeaveCriticalSection(&mutex_proyectiles);
 }
 
+// Crea un nuevo proyectil en el sistema
 int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, const char* remitente) {
     EnterCriticalSection(&mutex_proyectiles);
 
+    // Buscar slot libre
     int index = -1;
     for (int i = 0; i < MAX_PROYECTILES; i++) {
         if (!proyectiles[i].activo) {
@@ -327,6 +330,7 @@ int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, con
 
     DatosProyectil* p = &proyectiles[index];
 
+    // Inicializar proyectil
     EnterCriticalSection(&p->mutex);
     p->pos_x = x;
     p->pos_y = y;
@@ -352,6 +356,7 @@ int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, con
     return index;
 }
 
+// Elimina un proyectil del sistema
 void EliminarProyectil(int index) {
     if (index < 0 || index >= MAX_PROYECTILES) return;
 
@@ -363,6 +368,29 @@ void EliminarProyectil(int index) {
     LeaveCriticalSection(&mutex_proyectiles);
 }
 
+// Detección de colisión rectángulo vs rectángulo
+BOOL ColisionaRectangulos(double x1, double y1, double w1, double h1,
+    double x2, double y2, double w2, double h2) {
+    return !(x1 + w1 <= x2 || x2 + w2 <= x1 || y1 + h1 <= y2 || y2 + h2 <= y1);
+}
+
+// Verifica colisión del proyectil con una barra
+BOOL ColisionaConBarra(double x, double y, const BarraJuego* barra) {
+    return ColisionaRectangulos(
+        x - TAM_BOLA / 2, y - TAM_BOLA / 2, TAM_BOLA, TAM_BOLA,  // Proyectil
+        barra->x, barra->y, barra->ancho, barra->alto        // Barra
+    );
+}
+
+// Verifica colisión del proyectil con el personaje
+BOOL ColisionaConPersonaje(double proj_x, double proj_y) {
+    return ColisionaRectangulos(
+        proj_x - TAM_BOLA / 2, proj_y - TAM_BOLA / 2, TAM_BOLA, TAM_BOLA,  // Proyectil
+        personaje_x, personaje_y, ANCHO_PERSONAJE, ALTO_PERSONAJE      // Personaje
+    );
+}
+
+// Actualiza la física y colisiones de un proyectil
 void ActualizarProyectil(int index) {
     if (index < 0 || index >= MAX_PROYECTILES) return;
 
@@ -371,42 +399,42 @@ void ActualizarProyectil(int index) {
 
     EnterCriticalSection(&p->mutex);
 
-    // ✅ SINCRONIZADO CON LINUX: Misma normalización de velocidad
+    // Calcular velocidad normalizada para movimiento visual constante
     double velocidad_total = sqrt(p->vel_x * p->vel_x + p->vel_y * p->vel_y);
     double factor_normalizacion = VELOCIDAD_VISUAL_CONSTANTE / velocidad_total;
 
     double vel_x_visual = p->vel_x * factor_normalizacion;
     double vel_y_visual = p->vel_y * factor_normalizacion;
 
+    // Calcular nueva posición según física parabólica
     if (p->es_local) {
-        // Local projectile physics
+        // Proyectil local - movimiento normal
         p->x = p->pos_x + vel_x_visual * p->tiempo_ini * ESCALA_VISUAL;
         p->y = p->pos_y - (vel_y_visual * p->tiempo_ini -
             0.5 * G * factor_normalizacion * p->tiempo_ini * p->tiempo_ini) * ESCALA_VISUAL;
     }
     else {
-        // Mirror effect for remote projectiles
+        // Proyectil remoto - efecto espejo horizontal
         p->x = p->pos_x + vel_x_visual * p->tiempo_ini * ESCALA_VISUAL;
-        p->x = (2 * gameArea.right) - p->x;  // Horizontal mirror
+        p->x = (2 * gameArea.right) - p->x;
         p->y = p->pos_y - (vel_y_visual * p->tiempo_ini -
             0.5 * G * factor_normalizacion * p->tiempo_ini * p->tiempo_ini) * ESCALA_VISUAL;
     }
 
-    // ✅ SINCRONIZADO CON LINUX: Mismo incremento de tiempo
-    p->tiempo_ini += DELTA_T;  // 0.02 igual que Linux
+    p->tiempo_ini += DELTA_T;
 
     double x = p->x;
     double y = p->y;
 
     LeaveCriticalSection(&p->mutex);
 
-    // Check boundaries
+    // Verificar límites del área de juego
     if (y >= gameArea.bottom ||
         (p->es_local && x > gameArea.right + TAM_BOLA) ||
         (!p->es_local && x < gameArea.left - TAM_BOLA)) {
 
+        // Si es proyectil local que sale por la derecha, enviarlo por red
         if (p->es_local && x > gameArea.right + TAM_BOLA) {
-            // Send projectile data when it exits the screen via TCP
             Datos* datos = (Datos*)malloc(sizeof(Datos));
             if (datos) {
                 datos->x = x;
@@ -426,31 +454,23 @@ void ActualizarProyectil(int index) {
         return;
     }
 
-    // Solo proyectiles REMOTOS verifican colisiones con barras
+    // Solo proyectiles remotos verifican colisiones
     if (!p->es_local) {
-        // Check collisions with bars
+        // Verificar colisión con barras
         for (int i = 0; i < 3; i++) {
             if (!barras[i].visible) continue;
 
-            if (Colisiona(x, y, &barras[i])) {
-                // Destruir barra
+            if (ColisionaConBarra(x, y, &barras[i])) {
                 barras[i].visible = FALSE;
-
-                // Eliminar el proyectil
                 EliminarProyectil(index);
                 return;
             }
         }
 
-        // Check collision with character
+        // Verificar colisión con personaje - MEJORADA
         if (!personaje_destruido) {
-            if (x >= personaje_x && x <= personaje_x + ANCHO_PERSONAJE &&
-                y >= personaje_y && y <= personaje_y + ALTO_PERSONAJE) {
-
-                // Eliminar el proyectil ANTES de finalizar la partida
+            if (ColisionaConPersonaje(x, y)) {
                 EliminarProyectil(index);
-
-                // Finalizar partida
                 FinalizarPartida(p->remitente);
                 return;
             }
@@ -458,18 +478,20 @@ void ActualizarProyectil(int index) {
     }
 }
 
+// Actualiza todos los proyectiles activos
 void ActualizarProyectiles() {
     if (aplicacionCerrando) return;
 
     VerificarGravedadPersonaje();
 
+    // Actualizar cada proyectil
     for (int i = 0; i < MAX_PROYECTILES; i++) {
         if (proyectiles[i].activo) {
             ActualizarProyectil(i);
         }
     }
 
-    // Check if we can enable the fire button again
+    // Verificar si se puede habilitar el botón de disparo
     BOOL hayProyectilLocal = FALSE;
     EnterCriticalSection(&mutex_proyectiles);
     for (int i = 0; i < MAX_PROYECTILES; i++) {
@@ -488,11 +510,7 @@ void ActualizarProyectiles() {
     }
 }
 
-BOOL Colisiona(double x, double y, const BarraJuego* barra) {
-    return (x >= barra->x && x <= barra->x + barra->ancho &&
-        y >= barra->y && y <= barra->y + barra->alto);
-}
-
+// Finaliza la partida cuando el personaje es destruido
 void FinalizarPartida(const char* remitente) {
     personaje_destruido = TRUE;
 
@@ -506,6 +524,7 @@ void FinalizarPartida(const char* remitente) {
     ExitProcess(0);
 }
 
+// Cierra la aplicación de forma segura
 void CerrarAplicacion() {
     aplicacionCerrando = TRUE;
     serverActivo = FALSE;
@@ -540,11 +559,11 @@ void CerrarAplicacion() {
     ExitProcess(0);
 }
 
-// ✅ CAMBIADO DE UDP A TCP - FUNCIONES DE RED SINCRONIZADAS CON LINUX
+// Envía datos por TCP - protocolo limpio
 void EnviarDatosTCP(const char* ipDestino, const Datos* datos) {
     if (!ipDestino || strlen(ipDestino) == 0 || aplicacionCerrando) return;
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);  // ✅ CAMBIADO A TCP
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return;
 
     DWORD timeout = TIMEOUT_SEGUNDOS * 1000;
@@ -557,17 +576,15 @@ void EnviarDatosTCP(const char* ipDestino, const Datos* datos) {
 
     if (inet_pton(AF_INET, ipDestino, &servidor.sin_addr) == 1) {
         if (connect(s, (sockaddr*)&servidor, sizeof(servidor)) == 0) {
-            send(s, (const char*)datos, sizeof(Datos), 0);  // ✅ TCP send
-
-            // Recibir respuesta
-            char respuesta[32];
-            recv(s, respuesta, sizeof(respuesta), 0);
+            // Solo enviar estructura Datos
+            send(s, (const char*)datos, sizeof(Datos), 0);
         }
     }
 
     closesocket(s);
 }
 
+// Hilo cliente TCP
 DWORD WINAPI ClienteTCPThread(LPVOID param) {
     Datos* datos = (Datos*)param;
 
@@ -587,6 +604,7 @@ DWORD WINAPI ClienteTCPThread(LPVOID param) {
     return 0;
 }
 
+// Atiende conexiones de clientes TCP
 DWORD WINAPI AtenderClienteThread(LPVOID param) {
     SOCKET clientSocket = (SOCKET)(uintptr_t)param;
 
@@ -595,20 +613,17 @@ DWORD WINAPI AtenderClienteThread(LPVOID param) {
 
     if (bytesRecibidos == sizeof(Datos) && !aplicacionCerrando) {
         ProcesarDatosRecibidos(&datos);
-
-        // Enviar respuesta
-        char respuesta[32] = "Proyectil recibido";
-        send(clientSocket, respuesta, sizeof(respuesta), 0);
     }
 
     closesocket(clientSocket);
     return 0;
 }
 
+// Hilo servidor TCP principal
 DWORD WINAPI ServidorTCPThread(LPVOID param) {
     HWND hWnd = (HWND)param;
 
-    serverSocket = socket(AF_INET, SOCK_STREAM, 0);  // ✅ CAMBIADO A TCP
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket == INVALID_SOCKET) return 0;
 
     BOOL reuseAddr = TRUE;
@@ -625,7 +640,7 @@ DWORD WINAPI ServidorTCPThread(LPVOID param) {
         return 0;
     }
 
-    if (listen(serverSocket, 10) == SOCKET_ERROR) {  // ✅ TCP listen
+    if (listen(serverSocket, 10) == SOCKET_ERROR) {
         closesocket(serverSocket);
         serverSocket = INVALID_SOCKET;
         return 0;
@@ -635,10 +650,9 @@ DWORD WINAPI ServidorTCPThread(LPVOID param) {
         sockaddr_in cliente = { 0 };
         int len = sizeof(cliente);
 
-        SOCKET clientSocket = accept(serverSocket, (sockaddr*)&cliente, &len);  // ✅ TCP accept
+        SOCKET clientSocket = accept(serverSocket, (sockaddr*)&cliente, &len);
 
         if (clientSocket != INVALID_SOCKET && !aplicacionCerrando) {
-            // Crear hilo para atender cliente
             CreateThread(NULL, 0, AtenderClienteThread, (LPVOID)(uintptr_t)clientSocket, 0, NULL);
         }
         else if (clientSocket == INVALID_SOCKET) {
@@ -661,12 +675,14 @@ DWORD WINAPI ServidorTCPThread(LPVOID param) {
     return 0;
 }
 
+// Procesa datos recibidos de la red
 void ProcesarDatosRecibidos(const Datos* datos) {
     if (!aplicacionCerrando) {
         CrearProyectil(datos->xo, datos->yo, datos->vo, datos->ang, FALSE, datos->NN);
     }
 }
 
+// Valida los datos de entrada del usuario
 BOOL ValidarDatosEntrada() {
     TCHAR bufferVel[16], bufferAng[16], bufferIP[32];
     GetWindowText(hEditVelocidad, bufferVel, 16);
@@ -686,7 +702,6 @@ BOOL ValidarDatosEntrada() {
         return FALSE;
     }
 
-    // ✅ SINCRONIZADO CON LINUX: 1-89 grados
     if (angDeg <= 0 || angDeg >= 90) {
         MessageBox(hWndGlobal, L"El ángulo debe estar entre 1 y 89 grados.", L"Ángulo inválido", MB_OK | MB_ICONERROR);
         return FALSE;
@@ -700,6 +715,7 @@ BOOL ValidarDatosEntrada() {
     return TRUE;
 }
 
+// Limpia todos los proyectiles activos
 void LimpiarProyectiles() {
     EnterCriticalSection(&mutex_proyectiles);
     for (int i = 0; i < MAX_PROYECTILES; i++) {
@@ -709,6 +725,7 @@ void LimpiarProyectiles() {
     LeaveCriticalSection(&mutex_proyectiles);
 }
 
+// Libera todos los recursos del sistema
 void LimpiarRecursos() {
     LimpiarProyectiles();
 
@@ -734,6 +751,7 @@ void LimpiarRecursos() {
     }
 }
 
+// Punto de entrada principal de la aplicación
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
     _In_ LPWSTR lpCmdLine,
@@ -770,6 +788,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     return (int)msg.wParam;
 }
 
+// Registra la clase de ventana
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
     WNDCLASSEXW wcex = { 0 };
@@ -788,6 +807,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     return RegisterClassExW(&wcex);
 }
 
+// Inicializa la instancia de la aplicación
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 {
     hInst = hInstance;
@@ -806,6 +826,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     return TRUE;
 }
 
+// Procedimiento de ventana principal
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
@@ -818,6 +839,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_CREATE:
+        // Crear controles de interfaz
         CreateWindowW(L"STATIC", L"Nombre:", WS_CHILD | WS_VISIBLE,
             20, 15, 60, 20, hWnd, NULL, hInst, NULL);
         hEditNombre = CreateWindowW(L"EDIT", L"jugador1", WS_CHILD | WS_VISIBLE | WS_BORDER,
@@ -847,7 +869,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-        case 1: // Disparar button
+        case 1: // Botón disparar
         {
             if (personaje_destruido) {
                 MessageBox(hWnd, L"Personaje destruido. Reinicia el juego.", L"No se puede disparar", MB_OK | MB_ICONINFORMATION);
@@ -863,6 +885,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             }
 
+            // Obtener datos del usuario
             TCHAR bufferNombre[MAX_ALIAS];
             GetWindowText(hEditNombre, bufferNombre, MAX_ALIAS);
             WideCharToMultiByte(CP_UTF8, 0, bufferNombre, -1, alias_jugador, MAX_ALIAS, NULL, NULL);
@@ -874,6 +897,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             double vel = _wtof(bufferVel);
             double angRad = _wtof(bufferAng) * M_PI / 180.0;
 
+            // Crear proyectil desde el centro del personaje
             CrearProyectil(personaje_x + ANCHO_PERSONAJE / 2, personaje_y + ALTO_PERSONAJE / 2,
                 vel, angRad, TRUE, alias_jugador);
 
@@ -891,6 +915,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
 
+        // Solo redibujar si es necesario
         if (ps.rcPaint.left < gameArea.right && ps.rcPaint.right > gameArea.left &&
             ps.rcPaint.top < gameArea.bottom && ps.rcPaint.bottom > gameArea.top) {
 
@@ -916,6 +941,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+// Diálogo "Acerca de"
 INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 {
     UNREFERENCED_PARAMETER(lParam);
