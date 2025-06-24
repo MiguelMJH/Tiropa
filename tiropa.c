@@ -1,5 +1,6 @@
 /**
  * Compilar: gcc -o tiropa tiropa.c `pkg-config --cflags --libs gtk+-3.0` -lm -lpthread -export-dynamic
+ * VERSIÓN IDÉNTICA AL PROYECTO WINDOWS
  */
 #include <gtk/gtk.h>
 #include <cairo.h>
@@ -14,17 +15,15 @@
 #include <netinet/in.h>
 #include <time.h>
 
-#define G 9.8
+// Constantes físicas idénticas a Windows
+#define FUERZA_GRAVEDAD 9.8
+#define DELTA_TIEMPO 0.5
 #define PUERTO 4200
-#define ANCHO_PERSONAJE 50
-#define ALTO_PERSONAJE  40
+#define ANCHO_PERSONAJE 40
+#define ALTO_PERSONAJE  50
 #define TAM_BOLA        30
 #define MAX_ALIAS       32
-#define DELTA_T         0.02
 #define SLEEP_TIME      20000
-#define ANCHO_PANTALLA  1080
-#define ESCALA_VISUAL   3.0
-#define VELOCIDAD_VISUAL_CONSTANTE 150.0
 
 typedef struct {
     GtkWidget *widget;
@@ -38,33 +37,53 @@ gboolean set_widget_sensitive(gpointer data) {
     return FALSE;
 }
 
+// Estructura de datos de red idéntica a Windows
 typedef struct {
-    double x, y, xo, yo;
-    double vo, ang;
-    double to;
-    char NN[MAX_ALIAS];
-} Datos;
+    double x, y, velocidadInicialX, velocidadInicialY;
+    double velocidadTotal, anguloRadianes;
+    double tiempoTranscurrido;
+    char nombreJugador[32];
+} DATOS_RED;
 
+// Estructura de proyectil compatible con Windows
 typedef struct {
     GMutex mutex;
-    double x;
-    double y;
-    double pos_x;
-    double pos_y;
-    double vel_x;
-    double vel_y;
-    double tiempo_ini;
-    char remitente[MAX_ALIAS];
-} DatosEspejo;
+    double posicionInicialX, posicionInicialY;
+    double velocidadMovimientoX, velocidadMovimientoY;
+    double tiempoVida;
+    double velocidadLanzamiento;
+    double anguloDisparo;
+    char nombrePropietario[MAX_ALIAS];
+    int socketConexion;
+    int estaVisible;
+} ProyectilJuego;
 
 typedef struct {
-    int x, y, ancho, alto;
+    int x1, x2, y1, y2;
     int visible;
-} RECT;
+} CoordenadasPlataforma;
+
+typedef struct {
+    int x, y;
+} PosicionPersonaje;
 
 // Variables globales
+
+// Sistema de cola de mensajes para evitar múltiples diálogos
+typedef struct {
+    char mensaje[128];
+    int tipo; // 0=info, 1=victoria
+} MensajeRespuesta;
+
+GQueue *cola_mensajes = NULL;
+GMutex mutex_mensajes;
+gboolean procesando_mensaje = FALSE;
+int max_hilos_tcp = 3;  // Limitar hilos TCP simultáneos
+int hilos_tcp_activos = 0;
+GMutex mutex_hilos_tcp;
+
 GtkWidget *window, *draw1;
-GtkWidget *entryVel, *entryAng, *entryIP;
+GtkWidget *entryVel, *entryAng, *entryIP, *entryNombre;
 GtkWidget *btnDisparar, *btnSalir, *btnAcercaDe;
 cairo_surface_t *img_personaje, *img_bola;
 GtkAllocation allocation;
@@ -73,298 +92,167 @@ char alias[MAX_ALIAS];
 int personaje_destruido = 0;
 int tiro_en_progreso = 0;
 int servidor_activo = 1;
+int disparo_transmitido = 0;
 
-double personaje_xo, personaje_yo;
+CoordenadasPlataforma coordenadas_plataformas[3];
+PosicionPersonaje posicion_jugador;
+int posicion_inicial_x, posicion_inicial_y;
+int indice_plataforma_jugador = -1;
 
-RECT barras[3];
-DatosEspejo *proyectil_local = NULL;
+ProyectilJuego *proyectil_local = NULL;
+GList *lista_proyectiles_remotos = NULL;
+GMutex mutex_proyectiles;
 
-GList *lista_espejos = NULL;
-GMutex mutex_espejos;
+DATOS_RED datos_envio, datos_recepcion;
 
-pthread_mutex_t mutex_ganador = PTHREAD_MUTEX_INITIALIZER;
-gboolean ganador = FALSE;
-gboolean isGanador = FALSE;
-char nombre_ganador[MAX_ALIAS];
+// Control de recursos y limpieza
+pthread_t *hilos_activos = NULL;
+int num_hilos_activos = 0;
+GMutex mutex_hilos;
+int aplicacion_cerrando = 0;
 
 /**
- * Detecta colisión entre dos rectángulos usando intersección de áreas
- * @param proj_x Coordenada X del centro del proyectil
- * @param proj_y Coordenada Y del centro del proyectil
- * @param proj_ancho Ancho del proyectil
- * @param proj_alto Alto del proyectil
- * @param obj_x Coordenada X del objeto (esquina superior izquierda)
- * @param obj_y Coordenada Y del objeto (esquina superior izquierda)
- * @param obj_ancho Ancho del objeto
- * @param obj_alto Alto del objeto
- * @return 1 si hay colisión, 0 si no
+ * Detección de colisión precisa usando IntersectRect equivalente
  */
-int colisiona_rectangulos(double proj_x, double proj_y, int proj_ancho, int proj_alto, 
-                         double obj_x, double obj_y, int obj_ancho, int obj_alto) {
-    double proj_izq = proj_x - proj_ancho/2.0;
-    double proj_der = proj_x + proj_ancho/2.0;
-    double proj_arr = proj_y - proj_alto/2.0;
-    double proj_aba = proj_y + proj_alto/2.0;
+int detectar_colision_rectangulos(int x1, int y1, int w1, int h1, int x2, int y2, int w2, int h2) {
+    int izq1 = x1, der1 = x1 + w1, arr1 = y1, aba1 = y1 + h1;
+    int izq2 = x2, der2 = x2 + w2, arr2 = y2, aba2 = y2 + h2;
     
-    double obj_izq = obj_x;
-    double obj_der = obj_x + obj_ancho;
-    double obj_arr = obj_y;
-    double obj_aba = obj_y + obj_alto;
-    
-    int interseccion_x = (proj_izq < obj_der) && (proj_der > obj_izq);
-    int interseccion_y = (proj_arr < obj_aba) && (proj_aba > obj_arr);
-    
-    return interseccion_x && interseccion_y;
+    return (izq1 < der2) && (der1 > izq2) && (arr1 < aba2) && (aba1 > arr2);
 }
 
 /**
- * Función de compatibilidad para colisión con barras
- * @param x Coordenada X del proyectil
- * @param y Coordenada Y del proyectil
- * @param r Rectángulo de la barra
- * @return 1 si hay colisión, 0 si no
+ * Obtener nombre del jugador desde interfaz
  */
-int colisiona(double x, double y, RECT r) {
-    return colisiona_rectangulos(x, y, TAM_BOLA, TAM_BOLA, r.x, r.y, r.ancho, r.alto);
+void obtener_nombre_jugador_actual() {
+    const char *texto = gtk_entry_get_text(GTK_ENTRY(entryNombre));
+    if (strlen(texto) > 0) {
+        strncpy(alias, texto, MAX_ALIAS - 1);
+        alias[MAX_ALIAS - 1] = '\0';
+    } else {
+        strcpy(alias, "jugador1");
+    }
 }
 
-/**
- * Detecta colisión específica entre proyectil y personaje
- * @param proj_x Coordenada X del proyectil
- * @param proj_y Coordenada Y del proyectil
- * @return 1 si hay colisión, 0 si no
- */
-int colisiona_con_personaje(double proj_x, double proj_y) {
-    return colisiona_rectangulos(proj_x, proj_y, TAM_BOLA, TAM_BOLA, 
-                                personaje_xo, personaje_yo, ANCHO_PERSONAJE, ALTO_PERSONAJE);
-}
-
-// Prototipos de funciones
-void inicializar_barras_y_personaje();
-void *animar_tiro(void *arg);
-void *animar_espejo(void *arg);
-void enviar_datos(const char *ip);
-gboolean refrescar(gpointer data);
-gboolean on_draw1_draw(GtkDrawingArea *widget, cairo_t *cr);
-void *servidor_socket(void *arg);
-void *atender_cliente(void *arg);
-void finalizar_partida(const char *remitente);
-int validar_datos_entrada();
-
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        printf("Uso correcto: ./tiropa <tu_alias>\n");
-        return 1;
+// Función para procesar mensajes de forma serializada
+gboolean procesar_mensaje_cola(gpointer data) {
+    if (aplicacion_cerrando) return FALSE;
+    
+    g_mutex_lock(&mutex_mensajes);
+    
+    if (g_queue_is_empty(cola_mensajes)) {
+        procesando_mensaje = FALSE;
+        g_mutex_unlock(&mutex_mensajes);
+        return FALSE;
     }
     
-    if (strlen(argv[1]) >= MAX_ALIAS) {
-        printf("Error: El alias debe tener menos de %d caracteres\n", MAX_ALIAS);
-        return 1;
-    }
+    MensajeRespuesta *msg = g_queue_pop_head(cola_mensajes);
+    g_mutex_unlock(&mutex_mensajes);
     
-    strncpy(alias, argv[1], MAX_ALIAS - 1);
-    alias[MAX_ALIAS - 1] = '\0';
-
-    GtkBuilder *builder;
-    gtk_init(&argc, &argv);
-
-    builder = gtk_builder_new();
-    GError *error = NULL;
-    if (!gtk_builder_add_from_file(builder, "tiropa.glade", &error)) {
-        fprintf(stderr, "Error cargando interfaz: %s\n", error->message);
-        g_error_free(error);
-        return 1;
-    }
-
-    window       = GTK_WIDGET(gtk_builder_get_object(builder, "window"));
-    draw1        = GTK_WIDGET(gtk_builder_get_object(builder, "draw1"));
-    entryVel     = GTK_WIDGET(gtk_builder_get_object(builder, "entryVelocidad"));
-    entryAng     = GTK_WIDGET(gtk_builder_get_object(builder, "entryAngulo"));
-    entryIP      = GTK_WIDGET(gtk_builder_get_object(builder, "entryIP"));
-    btnDisparar  = GTK_WIDGET(gtk_builder_get_object(builder, "btnDisparar"));
-    btnSalir     = GTK_WIDGET(gtk_builder_get_object(builder, "btnSalir"));
-    btnAcercaDe  = GTK_WIDGET(gtk_builder_get_object(builder, "btnAcercaDe"));
-
-    if (!window || !draw1 || !entryVel || !entryAng || !entryIP || !btnDisparar) {
-        fprintf(stderr, "Error: No se pudieron cargar todos los widgets de la interfaz\n");
-        return 1;
-    }
-
-    gtk_builder_connect_signals(builder, NULL);
-    gtk_widget_show_all(window);
-    gtk_widget_get_allocation(draw1, &allocation);
-
-    g_mutex_init(&mutex_espejos);
-
-    // Cargar imagen del personaje y escalarla al tamaño definido
-    img_personaje = cairo_image_surface_create_from_png("personaje.png");
-    if (cairo_surface_status(img_personaje) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "Error al cargar personaje.png\n");
-        return 1;
-    }
-
-    int ow = cairo_image_surface_get_width(img_personaje);
-    int oh = cairo_image_surface_get_height(img_personaje);
-    
-    if (ow > 0 && oh > 0) {
-        double scale = (double)ALTO_PERSONAJE / oh;
-        int new_w = (int)(ow * scale);
-        int new_h = (int)(oh * scale);
-
-        cairo_surface_t *scaled_surface = cairo_surface_create_similar(img_personaje,
-                              CAIRO_CONTENT_COLOR_ALPHA, new_w, new_h);
-        cairo_t *cr = cairo_create(scaled_surface);
-        cairo_scale(cr, scale, scale);
-        cairo_set_source_surface(cr, img_personaje, 0, 0);
-        cairo_paint(cr);
-        cairo_destroy(cr);
-        
-        cairo_surface_destroy(img_personaje);
-        img_personaje = scaled_surface;
-    }
-
-    // Cargar imagen de la bola y escalarla a tamaño exacto
-    img_bola = cairo_image_surface_create_from_png("comer.png");
-    if (cairo_surface_status(img_bola) != CAIRO_STATUS_SUCCESS) {
-        fprintf(stderr, "Error al cargar comer.png\n");
-        return 1;
-    }
-
-    int bola_w = cairo_image_surface_get_width(img_bola);
-    int bola_h = cairo_image_surface_get_height(img_bola);
-
-    if (bola_w > 0 && bola_h > 0) {
-        cairo_surface_t *scaled_bola = cairo_surface_create_similar(img_bola,
-                              CAIRO_CONTENT_COLOR_ALPHA, TAM_BOLA, TAM_BOLA);
-        cairo_t *cr_bola = cairo_create(scaled_bola);
-        
-        double scale_x = (double)TAM_BOLA / bola_w;
-        double scale_y = (double)TAM_BOLA / bola_h;
-        
-        cairo_scale(cr_bola, scale_x, scale_y);
-        cairo_set_source_surface(cr_bola, img_bola, 0, 0);
-        cairo_paint(cr_bola);
-        cairo_destroy(cr_bola);
-        
-        cairo_surface_destroy(img_bola);
-        img_bola = scaled_bola;
-    }
-
-    inicializar_barras_y_personaje();
-    gtk_widget_queue_draw(draw1);
-
-    // Iniciar hilo del servidor TCP
-    pthread_t hiloServidor;
-    if (pthread_create(&hiloServidor, NULL, servidor_socket, NULL) != 0) {
-        fprintf(stderr, "Error creando hilo servidor\n");
-        return 1;
-    }
-
-    // Configurar timer de refresco de pantalla
-    g_timeout_add(20, refrescar, NULL);
-
-    gtk_main();
-
-    // Limpieza al salir
-    servidor_activo = 0;
-    pthread_cancel(hiloServidor);
-    
-    if (img_personaje) cairo_surface_destroy(img_personaje);
-    if (img_bola) cairo_surface_destroy(img_bola);
-    
-    return 0;
-}
-
-/**
- * Función de callback para refrescar la pantalla periódicamente
- */
-gboolean refrescar(gpointer data) {
-    gtk_widget_queue_draw(draw1);
-    return TRUE;
-}
-
-/**
- * Función de renderizado principal usando Cairo
- */
-gboolean on_draw1_draw(GtkDrawingArea *widget, cairo_t *cr) {
-    // Limpiar fondo con color blanco
-    cairo_set_source_rgb(cr, 1, 1, 1);
-    cairo_paint(cr);
-
-    // Renderizar barras visibles
-    cairo_set_source_rgb(cr, 0.3, 0.3, 1.0);
-    for (int i = 0; i < 3; i++) {
-        if (barras[i].visible) {
-            cairo_rectangle(cr, barras[i].x, barras[i].y, barras[i].ancho, barras[i].alto);
-            cairo_fill(cr);
+    if (msg && !aplicacion_cerrando) {
+        GtkWidget *dialog;
+        if (msg->tipo == 1) {
+            dialog = gtk_message_dialog_new(
+                GTK_WINDOW(window),
+                GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK,
+                "¡Eliminaste el objetivo!");
+        } else {
+            dialog = gtk_message_dialog_new(
+                GTK_WINDOW(window),
+                GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK,
+                "%s", msg->mensaje);
         }
-    }
-
-    // Renderizar personaje si no está destruido
-    if (!personaje_destruido && img_personaje) {
-        cairo_set_source_surface(cr, img_personaje, personaje_xo, personaje_yo);
-        cairo_paint(cr);
-    }
-
-    // Renderizar proyectil local
-    if (proyectil_local != NULL) {
-        g_mutex_lock(&proyectil_local->mutex);
-        double x = proyectil_local->x;
-        double y = proyectil_local->y;
-        g_mutex_unlock(&proyectil_local->mutex);
         
-        cairo_set_source_surface(cr, img_bola, x - TAM_BOLA/2, y - TAM_BOLA/2);
-        cairo_paint(cr);
-    }
-
-    // Renderizar proyectiles remotos (espejos)
-    g_mutex_lock(&mutex_espejos);
-    for (GList *n = lista_espejos; n != NULL; n = n->next) {
-        DatosEspejo *d = (DatosEspejo*)n->data;
-        g_mutex_lock(&d->mutex);
-        double x = d->x;
-        double y = d->y;
-        g_mutex_unlock(&d->mutex);
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
         
-        cairo_set_source_surface(cr, img_bola, x - TAM_BOLA/2, y - TAM_BOLA/2);
-        cairo_paint(cr);
+        // Reactivar botón SIEMPRE después de mostrar mensaje
+        SensibleData *info = g_malloc(sizeof(SensibleData));
+        info->widget = btnDisparar;
+        info->sensitive = TRUE;
+        g_idle_add(set_widget_sensitive, info);
+        disparo_transmitido = 0;
+        tiro_en_progreso = 0;  // AGREGAR: También resetear tiro_en_progreso
     }
-    g_mutex_unlock(&mutex_espejos);
-
+    
+    if (msg) free(msg);
+    
+    // Continuar procesando si hay más mensajes
+    g_mutex_lock(&mutex_mensajes);
+    if (!g_queue_is_empty(cola_mensajes)) {
+        g_timeout_add(100, procesar_mensaje_cola, NULL);
+    } else {
+        procesando_mensaje = FALSE;
+    }
+    g_mutex_unlock(&mutex_mensajes);
+    
     return FALSE;
 }
 
-/**
- * Termina la partida cuando el personaje es destruido
- */
-void finalizar_partida(const char *remitente) {
-    personaje_destruido = 1;
+// Función para agregar mensaje a la cola
+void agregar_mensaje_cola(const char* mensaje, int tipo) {
+    if (aplicacion_cerrando) return;
     
-    GtkWidget *dialog = gtk_message_dialog_new(
-        GTK_WINDOW(window),
-        GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_INFO,
-        GTK_BUTTONS_OK,
-        "¡Tu personaje ha sido destruido por %s!\nLa aplicación se cerrará.", remitente);
+    MensajeRespuesta *msg = malloc(sizeof(MensajeRespuesta));
+    strncpy(msg->mensaje, mensaje, 127);
+    msg->mensaje[127] = '\0';
+    msg->tipo = tipo;
     
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
+    g_mutex_lock(&mutex_mensajes);
+    g_queue_push_tail(cola_mensajes, msg);
     
-    gtk_main_quit();
+    // Iniciar procesamiento si no está activo
+    if (!procesando_mensaje) {
+        procesando_mensaje = TRUE;
+        g_idle_add(procesar_mensaje_cola, NULL);
+    }
+    g_mutex_unlock(&mutex_mensajes);
+    
+    return;
 }
 
 /**
- * Envía datos del proyectil al servidor remoto via TCP
+ * Cliente TCP para transmisión con sistema de respuestas
  */
-void enviar_datos(const char *ip_destino) {
-    if (!ip_destino || strlen(ip_destino) == 0) {
-        return;
+void *hilo_cliente_tcp(void *arg) {
+    char *ip_destino = (char*)arg;
+    int sockfd = -1;
+    
+    // Limitar hilos TCP simultáneos
+    g_mutex_lock(&mutex_hilos_tcp);
+    if (hilos_tcp_activos >= max_hilos_tcp) {
+        g_mutex_unlock(&mutex_hilos_tcp);
+        free(ip_destino);
+        
+        // Reactivar botón si no se puede crear hilo
+        if (!aplicacion_cerrando) {
+            SensibleData *info = g_malloc(sizeof(SensibleData));
+            info->widget = btnDisparar;
+            info->sensitive = TRUE;
+            g_idle_add(set_widget_sensitive, info);
+            disparo_transmitido = 0;
+        }
+        return NULL;
+    }
+    hilos_tcp_activos++;
+    g_mutex_unlock(&mutex_hilos_tcp);
+    
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        free(ip_destino);
+        goto cleanup_hilo_tcp;
     }
 
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        return;
-    }
+    // Configurar timeout más corto
+    struct timeval timeout;
+    timeout.tv_sec = 3;  // 3 segundos timeout
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -372,42 +260,78 @@ void enviar_datos(const char *ip_destino) {
     serv_addr.sin_port = htons(PUERTO);
     
     if (inet_pton(AF_INET, ip_destino, &serv_addr.sin_addr) <= 0) {
-        close(sockfd);
-        return;
+        goto cleanup_socket_tcp;
     }
 
     if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sockfd);
-        return;
+        goto cleanup_socket_tcp;
     }
 
-    Datos datos;
-    if (proyectil_local != NULL) {
-        g_mutex_lock(&proyectil_local->mutex);
-        datos.x = proyectil_local->x;
-        datos.y = proyectil_local->y;
-        datos.xo = proyectil_local->pos_x;
-        datos.yo = proyectil_local->pos_y;
-        datos.vo = proyectil_local->vel_x / cos(atan2(proyectil_local->vel_y, proyectil_local->vel_x));
-        datos.ang = atan2(proyectil_local->vel_y, proyectil_local->vel_x);
-        datos.to = proyectil_local->tiempo_ini;
-        strncpy(datos.NN, alias, MAX_ALIAS - 1);
-        datos.NN[MAX_ALIAS - 1] = '\0';
-        g_mutex_unlock(&proyectil_local->mutex);
+    // Enviar datos del proyectil
+    if (send(sockfd, (char*)&datos_envio, sizeof(DATOS_RED), 0) < 0) {
+        goto cleanup_socket_tcp;
+    }
+
+    // Escuchar UNA SOLA respuesta
+    char buffer_respuesta[64];
+    int bytes_recibidos = recv(sockfd, buffer_respuesta, sizeof(buffer_respuesta) - 1, 0);
+
+    if (bytes_recibidos > 0 && !aplicacion_cerrando) {
+        buffer_respuesta[bytes_recibidos] = '\0';
+        
+        // Agregar a cola en lugar de mostrar directamente
+        if (strstr(buffer_respuesta, "Impacto con personaje") != NULL) {
+            agregar_mensaje_cola("¡Eliminaste el objetivo!", 1);
+        } else {
+            agregar_mensaje_cola(buffer_respuesta, 0);
+        }
     } else {
+        // SIEMPRE reactivar botón, incluso si no hay respuesta o hay error
+        if (!aplicacion_cerrando) {
+            SensibleData *info = g_malloc(sizeof(SensibleData));
+            info->widget = btnDisparar;
+            info->sensitive = TRUE;
+            g_idle_add(set_widget_sensitive, info);
+            disparo_transmitido = 0;
+        }
+    }
+
+cleanup_socket_tcp:
+    if (sockfd >= 0) {
+        shutdown(sockfd, SHUT_RDWR);
         close(sockfd);
-        return;
     }
     
-    write(sockfd, (char *)&datos, sizeof(Datos));
-    close(sockfd);
+    if (ip_destino) free(ip_destino);
+    
+cleanup_hilo_tcp:
+    // Decrementar contador de hilos TCP
+    g_mutex_lock(&mutex_hilos_tcp);
+    hilos_tcp_activos--;
+    g_mutex_unlock(&mutex_hilos_tcp);
+    
+    return NULL;
 }
 
 /**
- * Hilo para animar el proyectil local con física parabólica
+ * Enviar datos del proyectil con sistema de respuestas
+ */
+void enviar_datos_red(const char *ip_destino) {
+    if (!ip_destino || strlen(ip_destino) == 0) return;
+    
+    char *ip_copia = malloc(strlen(ip_destino) + 1);
+    strcpy(ip_copia, ip_destino);
+    
+    pthread_t hilo_cliente;
+    pthread_create(&hilo_cliente, NULL, hilo_cliente_tcp, ip_copia);
+    pthread_detach(hilo_cliente);
+}
+
+/**
+ * Animación del proyectil local con física idéntica a Windows
  */
 void *animar_tiro(void *arg) {
-    proyectil_local = malloc(sizeof(DatosEspejo));
+    proyectil_local = malloc(sizeof(ProyectilJuego));
     if (!proyectil_local) {
         tiro_en_progreso = 0;
         return NULL;
@@ -421,231 +345,283 @@ void *animar_tiro(void *arg) {
     double velocidad_inicial = atof(vel_txt);
     double angulo_rad = atof(ang_txt) * M_PI / 180.0;
     
-    double velocidad_total = velocidad_inicial;
-    double factor_normalizacion = VELOCIDAD_VISUAL_CONSTANTE / velocidad_total;
+    obtener_nombre_jugador_actual();
     
-    // Inicializar posición y velocidad del proyectil
+    // Inicializar proyectil con física de Windows
     g_mutex_lock(&proyectil_local->mutex);
-    proyectil_local->pos_x = personaje_xo + ANCHO_PERSONAJE/2;
-    proyectil_local->pos_y = personaje_yo + ALTO_PERSONAJE/2;
-    proyectil_local->x = proyectil_local->pos_x;
-    proyectil_local->y = proyectil_local->pos_y;
-    proyectil_local->vel_x = velocidad_inicial * cos(angulo_rad);
-    proyectil_local->vel_y = velocidad_inicial * sin(angulo_rad);
-    proyectil_local->tiempo_ini = 0.0;
-    strncpy(proyectil_local->remitente, alias, MAX_ALIAS - 1);
-    proyectil_local->remitente[MAX_ALIAS - 1] = '\0';
+    proyectil_local->posicionInicialX = 0.0;
+    proyectil_local->posicionInicialY = 0.0;
+    proyectil_local->velocidadMovimientoX = velocidad_inicial * cos(angulo_rad);
+    proyectil_local->velocidadMovimientoY = velocidad_inicial * sin(angulo_rad);
+    proyectil_local->velocidadLanzamiento = velocidad_inicial;
+    proyectil_local->tiempoVida = 0.0;
+    proyectil_local->anguloDisparo = angulo_rad;
+    proyectil_local->estaVisible = 1;
+    strncpy(proyectil_local->nombrePropietario, alias, MAX_ALIAS - 1);
+    proyectil_local->nombrePropietario[MAX_ALIAS - 1] = '\0';
     g_mutex_unlock(&proyectil_local->mutex);
 
-    gboolean enviado = FALSE;
+    disparo_transmitido = 0;
     
-    // Bucle principal de animación
+    // Bucle de animación con ecuaciones de Windows
     while (1) {
         g_mutex_lock(&proyectil_local->mutex);
         
-        // Aplicar normalización de velocidad visual
-        double vel_x_visual = proyectil_local->vel_x * factor_normalizacion;
-        double vel_y_visual = proyectil_local->vel_y * factor_normalizacion;
+        // Ecuaciones físicas idénticas a Windows
+        proyectil_local->posicionInicialX = proyectil_local->velocidadMovimientoX * proyectil_local->tiempoVida;
+        proyectil_local->posicionInicialY = proyectil_local->velocidadMovimientoY * proyectil_local->tiempoVida - 
+                                           DELTA_TIEMPO * FUERZA_GRAVEDAD * proyectil_local->tiempoVida * proyectil_local->tiempoVida;
+        proyectil_local->tiempoVida += DELTA_TIEMPO;
         
-        // Calcular nueva posición usando ecuaciones de movimiento parabólico
-        proyectil_local->x = proyectil_local->pos_x + vel_x_visual * proyectil_local->tiempo_ini * ESCALA_VISUAL;
-        proyectil_local->y = proyectil_local->pos_y - (vel_y_visual * proyectil_local->tiempo_ini - 
-                             0.5 * G * factor_normalizacion * proyectil_local->tiempo_ini * proyectil_local->tiempo_ini) * ESCALA_VISUAL;
+        int coordenada_x = posicion_inicial_x + (int)proyectil_local->posicionInicialX;
+        int coordenada_y = posicion_inicial_y - (int)proyectil_local->posicionInicialY;
         
-        proyectil_local->tiempo_ini += DELTA_T;
-        
-        double x = proyectil_local->x;
-        double y = proyectil_local->y;
         g_mutex_unlock(&proyectil_local->mutex);
 
-        // Verificar colisión con el suelo
-        if (y >= allocation.height) {
+        // Verificar límites de pantalla
+        if (coordenada_x < 0 || coordenada_y > allocation.height - TAM_BOLA) {
+            // SOLO reactivar botón si NO se transmitió (no salió por la derecha)
+            if (!disparo_transmitido) {
+                SensibleData *info = g_malloc(sizeof(SensibleData));
+                info->widget = btnDisparar;
+                info->sensitive = TRUE;
+                g_idle_add(set_widget_sensitive, info);
+                disparo_transmitido = 0;
+            }
             break;
         }
-
-        // Verificar salida por borde derecho y enviar datos
-        if (x >= allocation.width + TAM_BOLA && !enviado) {
-            enviar_datos(gtk_entry_get_text(GTK_ENTRY(entryIP)));
-            enviado = TRUE;
+        
+        // Transmitir datos al salir por la derecha
+        if (coordenada_x > allocation.width && !disparo_transmitido) {
+            disparo_transmitido = 1;
+            
+            // Preparar datos para transmisión (formato Windows)
+            datos_envio.x = coordenada_x;
+            datos_envio.y = coordenada_y;
+            datos_envio.tiempoTranscurrido = proyectil_local->tiempoVida;
+            datos_envio.velocidadTotal = proyectil_local->velocidadLanzamiento;
+            datos_envio.velocidadInicialX = posicion_inicial_x;
+            datos_envio.velocidadInicialY = posicion_inicial_y;
+            datos_envio.anguloRadianes = proyectil_local->anguloDisparo;
+            strncpy(datos_envio.nombreJugador, alias, 32);
+            
+            enviar_datos_red(gtk_entry_get_text(GTK_ENTRY(entryIP)));
             break;
         }
 
         usleep(SLEEP_TIME);
     }
 
-    // Limpieza de recursos
+    // Limpieza
     g_mutex_clear(&proyectil_local->mutex);
     free(proyectil_local);
     proyectil_local = NULL;
-    
     tiro_en_progreso = 0;
-    
-    // Reactivar botón de disparo
-    SensibleData *info = g_malloc(sizeof(SensibleData));
-    info->widget = btnDisparar;
-    info->sensitive = TRUE;
-    g_idle_add(set_widget_sensitive, info);
     
     return NULL;
 }
 
 /**
- * Hilo para animar proyectiles remotos con efecto espejo
+ * Animación de proyectiles remotos con colisiones precisas
  */
-void *animar_espejo(void *arg) {
-    DatosEspejo *d = (DatosEspejo*)arg;
+void *animar_proyectil_remoto(void *arg) {
+    ProyectilJuego *proyectil = (ProyectilJuego*)arg;
     
-    // Agregar a lista de proyectiles activos
-    g_mutex_lock(&mutex_espejos);
-    lista_espejos = g_list_append(lista_espejos, d);
-    g_mutex_unlock(&mutex_espejos);
-
-    double velocidad_total = sqrt(d->vel_x * d->vel_x + d->vel_y * d->vel_y);
-    double factor_normalizacion = VELOCIDAD_VISUAL_CONSTANTE / velocidad_total;
-
-    double x, y;
-    gboolean salir = FALSE;
+    if (!proyectil) return NULL;
     
-    // Bucle principal de animación del proyectil remoto
-    while (TRUE) {
-        pthread_mutex_lock(&mutex_ganador);
-        if (ganador) {
-            pthread_mutex_unlock(&mutex_ganador);
-            break;
-        }
-        pthread_mutex_unlock(&mutex_ganador);
-        
-        double nt = DELTA_T;
-        
-        g_mutex_lock(&d->mutex);    
-        // Aplicar normalización de velocidad
-        double vel_x_visual = d->vel_x * factor_normalizacion;
-        double vel_y_visual = d->vel_y * factor_normalizacion;
-        
-        // Calcular posición con efecto espejo horizontal
-        d->x = d->pos_x + vel_x_visual * d->tiempo_ini * ESCALA_VISUAL; 
-        d->x = (2 * allocation.width) - d->x;  // Efecto espejo
-        d->y = d->pos_y - (vel_y_visual * d->tiempo_ini - 0.5 * G * factor_normalizacion * d->tiempo_ini * d->tiempo_ini) * ESCALA_VISUAL;
-        d->tiempo_ini += nt;        
-        x = d->x;       
-        y = d->y;       
-        g_mutex_unlock(&d->mutex);
+    // Registrar hilo activo
+    g_mutex_lock(&mutex_hilos);
+    num_hilos_activos++;
+    g_mutex_unlock(&mutex_hilos);
+    
+    g_mutex_lock(&mutex_proyectiles);
+    lista_proyectiles_remotos = g_list_append(lista_proyectiles_remotos, proyectil);
+    g_mutex_unlock(&mutex_proyectiles);
 
-        // Verificar colisión con el suelo
-        if (y >= allocation.height - 12) {
+    int hay_impacto = 0;
+    int socket_valido = (proyectil->socketConexion > 0);
+    
+    while (!aplicacion_cerrando && !hay_impacto) {
+        if (!proyectil || !proyectil->estaVisible) break;
+        
+        g_mutex_lock(&proyectil->mutex);
+        
+        // Física idéntica a Windows con efecto espejo
+        float posicion_pantalla_x = proyectil->posicionInicialX + (proyectil->velocidadMovimientoX * proyectil->tiempoVida);
+        float posicion_pantalla_y = proyectil->posicionInicialY - (proyectil->velocidadMovimientoY * proyectil->tiempoVida - 
+                                   DELTA_TIEMPO * FUERZA_GRAVEDAD * proyectil->tiempoVida * proyectil->tiempoVida);
+        proyectil->tiempoVida += DELTA_TIEMPO;
+        
+        g_mutex_unlock(&proyectil->mutex);
+
+        // Verificar colisión con suelo
+        if (posicion_pantalla_y > allocation.height - TAM_BOLA) {
+            if (socket_valido) {
+                char mensaje_limite[] = "Proyectil salio de pantalla";
+                send(proyectil->socketConexion, mensaje_limite, strlen(mensaje_limite) + 1, MSG_NOSIGNAL);
+            }
             break;
         }
         
-        // Verificar colisión con barras
-        for (int i = 0; i < 3; i++) {
-            if (!barras[i].visible) continue;
+        // Detección precisa de colisión con personaje
+        if (!personaje_destruido && 
+            detectar_colision_rectangulos((int)posicion_pantalla_x, (int)posicion_pantalla_y, 30, 30,
+                                        posicion_jugador.x, posicion_jugador.y, ANCHO_PERSONAJE, ALTO_PERSONAJE)) {
             
-            if (colisiona(x, y, barras[i])) {
-                barras[i].visible = 0;
-
-                // Verificar si el personaje estaba sobre la barra destruida
-                if (!personaje_destruido &&
-                    personaje_xo + ANCHO_PERSONAJE > barras[i].x &&
-                    personaje_xo < barras[i].x + barras[i].ancho &&
-                    personaje_yo + ALTO_PERSONAJE >= barras[i].y) {
-                    
-                    personaje_yo = allocation.height - ALTO_PERSONAJE;
-                }
+            proyectil->estaVisible = 0;
+            hay_impacto = 1;
+            
+            if (socket_valido) {
+                char mensaje_respuesta[] = "Impacto con personaje";
+                send(proyectil->socketConexion, mensaje_respuesta, strlen(mensaje_respuesta) + 1, MSG_NOSIGNAL);
+            }
+            
+            if (!aplicacion_cerrando) {
+                char mensaje_eliminacion[64];
+                sprintf(mensaje_eliminacion, "Fuiste eliminado por %s", proyectil->nombrePropietario);
                 
-                salir = TRUE;
-                break;
+                GtkWidget *dialog = gtk_message_dialog_new(
+                    GTK_WINDOW(window),
+                    GTK_DIALOG_DESTROY_WITH_PARENT,
+                    GTK_MESSAGE_INFO,
+                    GTK_BUTTONS_OK,
+                    "%s", mensaje_eliminacion);
+                
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                
+                aplicacion_cerrando = 1;
+                servidor_activo = 0;
+                gtk_main_quit();
+            }
+            break;
+        }
+        
+        // Verificar colisiones con plataformas
+        if (!hay_impacto) {
+            for (int i = 0; i < 3; i++) {
+                if (!coordenadas_plataformas[i].visible) continue;
+                
+                int min_x = (coordenadas_plataformas[i].x1 < coordenadas_plataformas[i].x2) ? 
+                           coordenadas_plataformas[i].x1 : coordenadas_plataformas[i].x2;
+                int max_x = (coordenadas_plataformas[i].x1 > coordenadas_plataformas[i].x2) ? 
+                           coordenadas_plataformas[i].x1 : coordenadas_plataformas[i].x2;
+                int min_y = (coordenadas_plataformas[i].y1 < coordenadas_plataformas[i].y2) ? 
+                           coordenadas_plataformas[i].y1 : coordenadas_plataformas[i].y2;
+                int max_y = (coordenadas_plataformas[i].y1 > coordenadas_plataformas[i].y2) ? 
+                           coordenadas_plataformas[i].y1 : coordenadas_plataformas[i].y2;
+                
+                if (detectar_colision_rectangulos((int)posicion_pantalla_x, (int)posicion_pantalla_y, 30, 30,
+                                                min_x, min_y, max_x - min_x, max_y - min_y)) {
+                    
+                    coordenadas_plataformas[i].visible = 0;
+                    proyectil->estaVisible = 0;
+                    hay_impacto = 1;
+                    
+                    if (i == indice_plataforma_jugador) {
+                        posicion_jugador.y = allocation.height - ALTO_PERSONAJE;
+                        indice_plataforma_jugador = -1;
+                        posicion_inicial_y = posicion_jugador.y - 50;
+                    }
+                    
+                    if (socket_valido) {
+                        char mensaje_obstaculo[] = "Impacto con obstaculo";
+                        send(proyectil->socketConexion, mensaje_obstaculo, strlen(mensaje_obstaculo) + 1, MSG_NOSIGNAL);
+                    }
+                    break;
+                }
             }
         }
         
-        if (salir) break;
-        
-        // Verificar colisión con personaje usando detección rectángulo vs rectángulo
-        if (!personaje_destruido && colisiona_con_personaje(x, y)) {
-            pthread_mutex_lock(&mutex_ganador);
-            ganador = TRUE;
-            isGanador = TRUE;
-            strncpy(nombre_ganador, d->remitente, MAX_ALIAS);
-            pthread_mutex_unlock(&mutex_ganador);
-            
-            finalizar_partida(d->remitente);
-            break;
-        }
+        if (hay_impacto) break;
         
         // Verificar salida por borde izquierdo
-        if (x <= 0) {
+        if (posicion_pantalla_x < 0) {
+            if (socket_valido) {
+                char mensaje_limite[] = "Proyectil salio de pantalla";
+                send(proyectil->socketConexion, mensaje_limite, strlen(mensaje_limite) + 1, MSG_NOSIGNAL);
+            }
             break;
         }
         
         usleep(SLEEP_TIME);
     }
     
-    // Remover de lista y liberar memoria
-    g_mutex_lock(&mutex_espejos);
-    lista_espejos = g_list_remove(lista_espejos, d);
-    g_mutex_unlock(&mutex_espejos);
+    // Limpieza segura
+    g_mutex_lock(&mutex_proyectiles);
+    lista_proyectiles_remotos = g_list_remove(lista_proyectiles_remotos, proyectil);
+    g_mutex_unlock(&mutex_proyectiles);
     
-    g_mutex_clear(&d->mutex);
-    free(d);
+    if (proyectil) {
+        if (socket_valido) {
+            shutdown(proyectil->socketConexion, SHUT_RDWR);
+            close(proyectil->socketConexion);
+        }
+        g_mutex_clear(&proyectil->mutex);
+        free(proyectil);
+    }
+    
+    // Desregistrar hilo activo
+    g_mutex_lock(&mutex_hilos);
+    num_hilos_activos--;
+    g_mutex_unlock(&mutex_hilos);
     
     return NULL;
 }
 
 /**
- * Hilo para atender conexiones de clientes TCP
+ * Atender conexiones de clientes TCP
  */
 void *atender_cliente(void *arg) {
     int socket_cliente = *(int *)arg;
     free(arg);
     
-    // Leer estructura de datos del proyectil
-    Datos datos_recibidos;
-    if (read(socket_cliente, (char *)&datos_recibidos, sizeof(Datos)) <= 0) {
+    // Leer datos del proyectil
+    DATOS_RED datos_recibidos;
+    if (recv(socket_cliente, (char *)&datos_recibidos, sizeof(DATOS_RED), 0) <= 0) {
         close(socket_cliente);
         return NULL;
     }
     
-    // Crear estructura para proyectil remoto
-    DatosEspejo *de = malloc(sizeof(DatosEspejo));
-    if (!de) {
+    // Crear proyectil remoto
+    ProyectilJuego *proyectil_remoto = malloc(sizeof(ProyectilJuego));
+    if (!proyectil_remoto) {
         close(socket_cliente);
         return NULL;
     }
     
-    g_mutex_init(&de->mutex);
+    g_mutex_init(&proyectil_remoto->mutex);
     
-    // Inicializar datos del proyectil remoto
-    de->x = 0;
-    de->y = 0;
-    de->vel_x = datos_recibidos.vo * cos(datos_recibidos.ang);
-    de->vel_y = datos_recibidos.vo * sin(datos_recibidos.ang);
-    de->pos_x = datos_recibidos.xo;
-    de->pos_y = datos_recibidos.yo;
-    de->tiempo_ini = datos_recibidos.to;
-    strncpy(de->remitente, datos_recibidos.NN, MAX_ALIAS - 1);
-    de->remitente[MAX_ALIAS - 1] = '\0';
+    // Inicializar con datos recibidos (formato Windows)
+    proyectil_remoto->posicionInicialX = datos_recibidos.x + ((datos_recibidos.velocidadTotal * cos(datos_recibidos.anguloRadianes)) * datos_recibidos.tiempoTranscurrido);
+    proyectil_remoto->posicionInicialY = datos_recibidos.y + ((datos_recibidos.velocidadTotal * sin(datos_recibidos.anguloRadianes)) * datos_recibidos.tiempoTranscurrido - FUERZA_GRAVEDAD * datos_recibidos.tiempoTranscurrido * datos_recibidos.tiempoTranscurrido * DELTA_TIEMPO);
+    proyectil_remoto->velocidadMovimientoX = -(datos_recibidos.velocidadTotal * cos(datos_recibidos.anguloRadianes));
+    proyectil_remoto->velocidadMovimientoY = (datos_recibidos.velocidadTotal * sin(datos_recibidos.anguloRadianes));
+    proyectil_remoto->tiempoVida = datos_recibidos.tiempoTranscurrido;
+    proyectil_remoto->socketConexion = socket_cliente;
+    proyectil_remoto->estaVisible = 1;
+    strncpy(proyectil_remoto->nombrePropietario, datos_recibidos.nombreJugador, MAX_ALIAS - 1);
+    proyectil_remoto->nombrePropietario[MAX_ALIAS - 1] = '\0';
     
-    // Crear hilo para animar el proyectil remoto
-    pthread_t hilo_espejo;
-    if (pthread_create(&hilo_espejo, NULL, animar_espejo, de) != 0) {
-        g_mutex_clear(&de->mutex);
-        free(de);
+    // Crear hilo de animación
+    pthread_t hilo_animacion;
+    if (pthread_create(&hilo_animacion, NULL, animar_proyectil_remoto, proyectil_remoto) != 0) {
+        g_mutex_clear(&proyectil_remoto->mutex);
+        free(proyectil_remoto);
         close(socket_cliente);
         return NULL;
     }
-    pthread_detach(hilo_espejo);
+    pthread_detach(hilo_animacion);
     
-    close(socket_cliente);
     return NULL;
 }
 
 /**
- * Hilo principal del servidor TCP
+ * Servidor TCP principal
  */
 void *servidor_socket(void *arg) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        return NULL;
-    }
+    if (server_fd < 0) return NULL;
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -666,19 +642,13 @@ void *servidor_socket(void *arg) {
         return NULL;
     }
 
-    // Bucle principal del servidor
     while (servidor_activo) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_fd < 0) {
-            if (servidor_activo) {
-                continue;
-            }
-        }
+        if (client_fd < 0) continue;
         
-        // Crear hilo para atender cliente
         int *socket_cliente = malloc(sizeof(int));
         *socket_cliente = client_fd;
         
@@ -696,85 +666,81 @@ void *servidor_socket(void *arg) {
 }
 
 /**
- * Inicializa posiciones aleatorias de barras y personaje
+ * Inicializar coordenadas del juego (estilo Windows)
  */
-void inicializar_barras_y_personaje() {
+void inicializar_coordenadas_juego() {
     gtk_widget_get_allocation(draw1, &allocation);
     srand(time(NULL));
 
-    // Generar barras en la mitad izquierda de la pantalla
-    int baseX = rand() % (allocation.width / 2 - 3 * 70);
+    int coordenada_x1 = rand() % (allocation.width / 2 - 3 * 70);
+    int coordenada_x2 = coordenada_x1 + 70;
+    int plataforma_seleccionada = (rand() % 3) + 1;
+
     for (int i = 0; i < 3; i++) {
-        barras[i].ancho = 70;
-        barras[i].alto = 50 + rand() % (allocation.height / 2 - 50);
-        barras[i].x = baseX + i * 70;
-        barras[i].y = allocation.height - barras[i].alto;
-        barras[i].visible = 1;
+        coordenadas_plataformas[i].x1 = coordenada_x1;
+        coordenadas_plataformas[i].x2 = coordenada_x2;
+        coordenadas_plataformas[i].y1 = allocation.height;
+        coordenadas_plataformas[i].y2 = 300 + rand() % (500 - 300 + 1);
+        coordenadas_plataformas[i].visible = 1;
+
+        if ((i + 1) == plataforma_seleccionada) {
+            posicion_jugador.x = coordenada_x1 + 15;
+            posicion_jugador.y = coordenadas_plataformas[i].y2 - 50;
+            indice_plataforma_jugador = i;
+        }
+
+        coordenada_x1 += 70;
+        coordenada_x2 += 70;
     }
 
-    // Posicionar personaje sobre una barra aleatoria
-    int elegido = rand() % 3;
-    personaje_xo = barras[elegido].x + (barras[elegido].ancho - ANCHO_PERSONAJE) / 2.0;
-    personaje_yo = barras[elegido].y - ALTO_PERSONAJE;
+    posicion_inicial_x = posicion_jugador.x + 17;
+    posicion_inicial_y = posicion_jugador.y - 50;
 }
 
 /**
- * Valida los datos de entrada del usuario
+ * Validación de entrada numérica
+ */
+int validar_entrada_numerica(const char *texto) {
+    if (!texto || strlen(texto) == 0) return 0;
+    
+    char *endptr;
+    double valor = strtod(texto, &endptr);
+    return (*endptr == '\0' && valor > 0);
+}
+
+/**
+ * Validar datos de entrada
  */
 int validar_datos_entrada() {
     const char *vel_txt = gtk_entry_get_text(GTK_ENTRY(entryVel));
     const char *ang_txt = gtk_entry_get_text(GTK_ENTRY(entryAng));
     const char *ip_txt = gtk_entry_get_text(GTK_ENTRY(entryIP));
 
-    if (!vel_txt || !ang_txt || !ip_txt || 
-        strlen(vel_txt) == 0 || strlen(ang_txt) == 0 || strlen(ip_txt) == 0) {
-        
+    if (!validar_entrada_numerica(vel_txt)) {
         GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Error: Todos los campos son obligatorios");
+            GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Ingresa un valor numérico válido para la velocidad.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return 0;
     }
 
-    double vel = atof(vel_txt);
-    double ang = atof(ang_txt);
-
-    if (vel <= 0 || vel > 1000) {
+    if (!validar_entrada_numerica(ang_txt)) {
         GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Error: La velocidad debe estar entre 1 y 1000");
+            GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Ingresa un valor numérico válido para el ángulo.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return 0;
     }
 
-    if (ang <= 0 || ang >= 90) {
+    if (!ip_txt || strlen(ip_txt) == 0) {
         GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Error: El ángulo debe estar entre 1 y 89 grados");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return 0;
-    }
-
-    struct sockaddr_in sa;
-    if (inet_pton(AF_INET, ip_txt, &(sa.sin_addr)) != 1) {
-        GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Error: La dirección IP no es válida");
+            GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Ingresa una dirección IP válida.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return 0;
@@ -784,15 +750,267 @@ int validar_datos_entrada() {
 }
 
 /**
- * Callback para el botón de disparo
+ * Función de renderizado principal
+ */
+gboolean on_draw1_draw(GtkDrawingArea *widget, cairo_t *cr) {
+    // Fondo blanco
+    cairo_set_source_rgb(cr, 1, 1, 1);
+    cairo_paint(cr);
+
+    // Renderizar plataformas con gradiente (estilo Windows)
+    for (int i = 0; i < 3; i++) {
+        if (!coordenadas_plataformas[i].visible) continue;
+
+        int min_x = (coordenadas_plataformas[i].x1 < coordenadas_plataformas[i].x2) ? 
+                   coordenadas_plataformas[i].x1 : coordenadas_plataformas[i].x2;
+        int max_x = (coordenadas_plataformas[i].x1 > coordenadas_plataformas[i].x2) ? 
+                   coordenadas_plataformas[i].x1 : coordenadas_plataformas[i].x2;
+        int min_y = (coordenadas_plataformas[i].y1 < coordenadas_plataformas[i].y2) ? 
+                   coordenadas_plataformas[i].y1 : coordenadas_plataformas[i].y2;
+        int max_y = (coordenadas_plataformas[i].y1 > coordenadas_plataformas[i].y2) ? 
+                   coordenadas_plataformas[i].y1 : coordenadas_plataformas[i].y2;
+
+        cairo_pattern_t *gradiente = cairo_pattern_create_linear(min_x, min_y, min_x, max_y);
+        cairo_pattern_add_color_stop_rgb(gradiente, 0, 0.25, 0.5, 1.0);
+        cairo_pattern_add_color_stop_rgb(gradiente, 1, 0.5, 0.0, 1.0);
+        
+        cairo_set_source(cr, gradiente);
+        cairo_rectangle(cr, min_x, min_y, max_x - min_x, max_y - min_y);
+        cairo_fill(cr);
+        cairo_pattern_destroy(gradiente);
+    }
+
+    // Renderizar personaje
+    if (!personaje_destruido && img_personaje) {
+        cairo_set_source_surface(cr, img_personaje, posicion_jugador.x, posicion_jugador.y);
+        cairo_paint(cr);
+    }
+
+    // Renderizar proyectil local
+    if (proyectil_local != NULL && proyectil_local->estaVisible) {
+        g_mutex_lock(&proyectil_local->mutex);
+        int coordenada_x = posicion_inicial_x + (int)proyectil_local->posicionInicialX;
+        int coordenada_y = posicion_inicial_y - (int)proyectil_local->posicionInicialY;
+        g_mutex_unlock(&proyectil_local->mutex);
+        
+        cairo_set_source_surface(cr, img_bola, coordenada_x - TAM_BOLA/2, coordenada_y - TAM_BOLA/2);
+        cairo_paint(cr);
+    }
+
+    // Renderizar proyectiles remotos
+    g_mutex_lock(&mutex_proyectiles);
+    for (GList *n = lista_proyectiles_remotos; n != NULL; n = n->next) {
+        ProyectilJuego *p = (ProyectilJuego*)n->data;
+        if (p->estaVisible) {
+            g_mutex_lock(&p->mutex);
+            float pos_x = p->posicionInicialX + (p->velocidadMovimientoX * p->tiempoVida);
+            float pos_y = p->posicionInicialY - (p->velocidadMovimientoY * p->tiempoVida - 
+                         DELTA_TIEMPO * FUERZA_GRAVEDAD * p->tiempoVida * p->tiempoVida);
+            g_mutex_unlock(&p->mutex);
+            
+            cairo_set_source_surface(cr, img_bola, (int)pos_x - TAM_BOLA/2, (int)pos_y - TAM_BOLA/2);
+            cairo_paint(cr);
+        }
+    }
+    g_mutex_unlock(&mutex_proyectiles);
+
+    return FALSE;
+}
+
+/**
+ * Función de refresco periódico
+ */
+gboolean refrescar(gpointer data) {
+    gtk_widget_queue_draw(draw1);
+    return TRUE;
+}
+
+void limpiar_recursos_aplicacion() {
+    aplicacion_cerrando = 1;
+    servidor_activo = 0;
+    
+    // Esperar a que terminen los hilos activos
+    int intentos = 0;
+    while (num_hilos_activos > 0 && intentos < 50) {
+        usleep(100000);  // 100ms
+        intentos++;
+    }
+    
+    // Limpiar proyectiles remotos
+    g_mutex_lock(&mutex_proyectiles);
+    for (GList *n = lista_proyectiles_remotos; n != NULL; n = n->next) {
+        ProyectilJuego *p = (ProyectilJuego*)n->data;
+        if (p) {
+            if (p->socketConexion > 0) {
+                close(p->socketConexion);
+            }
+            g_mutex_clear(&p->mutex);
+            free(p);
+        }
+    }
+    g_list_free(lista_proyectiles_remotos);
+    lista_proyectiles_remotos = NULL;
+    g_mutex_unlock(&mutex_proyectiles);
+    
+    // Limpiar proyectil local
+    if (proyectil_local) {
+        g_mutex_clear(&proyectil_local->mutex);
+        free(proyectil_local);
+        proyectil_local = NULL;
+    }
+    
+    // Limpiar mutex
+    g_mutex_clear(&mutex_proyectiles);
+    g_mutex_clear(&mutex_hilos);
+    
+    // Limpiar imágenes
+    if (img_personaje) {
+        cairo_surface_destroy(img_personaje);
+        img_personaje = NULL;
+    }
+    if (img_bola) {
+        cairo_surface_destroy(img_bola);
+        img_bola = NULL;
+    }
+
+    // Limpiar cola de mensajes
+    g_mutex_lock(&mutex_mensajes);
+    while (!g_queue_is_empty(cola_mensajes)) {
+        MensajeRespuesta *msg = g_queue_pop_head(cola_mensajes);
+        if (msg) free(msg);
+    }
+    g_queue_free(cola_mensajes);
+    g_mutex_unlock(&mutex_mensajes);
+    g_mutex_clear(&mutex_mensajes);
+    g_mutex_clear(&mutex_hilos_tcp);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Uso correcto: ./tiropa <tu_alias>\n");
+        return 1;
+    }
+    
+    strncpy(alias, argv[1], MAX_ALIAS - 1);
+    alias[MAX_ALIAS - 1] = '\0';
+
+    GtkBuilder *builder;
+    gtk_init(&argc, &argv);
+
+    builder = gtk_builder_new();
+    GError *error = NULL;
+    if (!gtk_builder_add_from_file(builder, "tiropa.glade", &error)) {
+        fprintf(stderr, "Error cargando interfaz: %s\n", error->message);
+        g_error_free(error);
+        return 1;
+    }
+
+    // Obtener widgets
+    window = GTK_WIDGET(gtk_builder_get_object(builder, "window"));
+    draw1 = GTK_WIDGET(gtk_builder_get_object(builder, "draw1"));
+    entryVel = GTK_WIDGET(gtk_builder_get_object(builder, "entryVelocidad"));
+    entryAng = GTK_WIDGET(gtk_builder_get_object(builder, "entryAngulo"));
+    entryIP = GTK_WIDGET(gtk_builder_get_object(builder, "entryIP"));
+    btnDisparar = GTK_WIDGET(gtk_builder_get_object(builder, "btnDisparar"));
+    btnSalir = GTK_WIDGET(gtk_builder_get_object(builder, "btnSalir"));
+    btnAcercaDe = GTK_WIDGET(gtk_builder_get_object(builder, "btnAcercaDe"));
+
+    // Crear campo de nombre en la interfaz
+    entryNombre = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entryNombre), alias);
+    gtk_widget_show(entryNombre);
+
+    gtk_builder_connect_signals(builder, NULL);
+    gtk_widget_show_all(window);
+    gtk_widget_get_allocation(draw1, &allocation);
+
+    g_mutex_init(&mutex_proyectiles);
+    g_mutex_init(&mutex_hilos);
+    cola_mensajes = g_queue_new();
+    g_mutex_init(&mutex_mensajes);
+    g_mutex_init(&mutex_hilos_tcp);
+
+    // Cargar imágenes escaladas
+    img_personaje = cairo_image_surface_create_from_png("personaje.png");
+    img_bola = cairo_image_surface_create_from_png("comer.png");
+
+    if (cairo_surface_status(img_personaje) != CAIRO_STATUS_SUCCESS ||
+        cairo_surface_status(img_bola) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Error al cargar imágenes\n");
+        return 1;
+    }
+
+    // Escalar imágenes a tamaños exactos
+    int ow = cairo_image_surface_get_width(img_personaje);
+    int oh = cairo_image_surface_get_height(img_personaje);
+    
+    if (ow > 0 && oh > 0) {
+        double scale = (double)ALTO_PERSONAJE / oh;
+        int new_w = (int)(ow * scale);
+        int new_h = (int)(oh * scale);
+
+        cairo_surface_t *scaled_surface = cairo_surface_create_similar(img_personaje,
+                              CAIRO_CONTENT_COLOR_ALPHA, new_w, new_h);
+        cairo_t *cr = cairo_create(scaled_surface);
+        cairo_scale(cr, scale, scale);
+        cairo_set_source_surface(cr, img_personaje, 0, 0);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+        
+        cairo_surface_destroy(img_personaje);
+        img_personaje = scaled_surface;
+    }
+
+    // Escalar proyectil a 30x30 exacto
+    int bola_w = cairo_image_surface_get_width(img_bola);
+    int bola_h = cairo_image_surface_get_height(img_bola);
+
+    if (bola_w > 0 && bola_h > 0) {
+        cairo_surface_t *scaled_bola = cairo_surface_create_similar(img_bola,
+                              CAIRO_CONTENT_COLOR_ALPHA, TAM_BOLA, TAM_BOLA);
+        cairo_t *cr_bola = cairo_create(scaled_bola);
+        
+        double scale_x = (double)TAM_BOLA / bola_w;
+        double scale_y = (double)TAM_BOLA / bola_h;
+        
+        cairo_scale(cr_bola, scale_x, scale_y);
+        cairo_set_source_surface(cr_bola, img_bola, 0, 0);
+        cairo_paint(cr_bola);
+        cairo_destroy(cr_bola);
+        
+        cairo_surface_destroy(img_bola);
+        img_bola = scaled_bola;
+    }
+
+    inicializar_coordenadas_juego();
+
+    // Iniciar servidor TCP
+    pthread_t hilo_servidor;
+    if (pthread_create(&hilo_servidor, NULL, servidor_socket, NULL) != 0) {
+        fprintf(stderr, "Error creando hilo servidor\n");
+        return 1;
+    }
+
+    // Timer de refresco
+    g_timeout_add(20, refrescar, NULL);
+
+    gtk_main();
+
+    // Limpieza
+    limpiar_recursos_aplicacion();
+    pthread_cancel(hilo_servidor);
+    
+    return 0;
+}
+
+/**
+ * Callback del botón disparar
  */
 void on_btnDisparar_clicked() {
     if (personaje_destruido) {
         GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_INFO,
-            GTK_BUTTONS_OK,
+            GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
             "Personaje destruido. Debes reiniciar la aplicación.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
@@ -801,22 +1019,18 @@ void on_btnDisparar_clicked() {
 
     if (tiro_en_progreso) {
         GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(window),
-            GTK_DIALOG_DESTROY_WITH_PARENT,
-            GTK_MESSAGE_WARNING,
-            GTK_BUTTONS_OK,
+            GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+            GTK_MESSAGE_WARNING, GTK_BUTTONS_OK,
             "Ya hay un tiro en progreso. Espera a que termine.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
     }
 
-    if (!validar_datos_entrada()) {
-        return;
-    }
+    if (!validar_datos_entrada()) return;
 
     tiro_en_progreso = 1;
-    gtk_widget_set_sensitive(btnDisparar, FALSE);
+    gtk_widget_set_sensitive(btnDisparar, FALSE);  // Bloquear hasta recibir respuesta
 
     pthread_t hilo;
     if (pthread_create(&hilo, NULL, animar_tiro, NULL) != 0) {
@@ -827,15 +1041,10 @@ void on_btnDisparar_clicked() {
     }
 }
 
-/**
- * Callback para el botón "Acerca de"
- */
 void on_btnAcercaDe_clicked() {
     GtkWidget *dialog = gtk_message_dialog_new(
-        GTK_WINDOW(window),
-        GTK_DIALOG_DESTROY_WITH_PARENT,
-        GTK_MESSAGE_INFO,
-        GTK_BUTTONS_OK,
+        GTK_WINDOW(window), GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
         "Tiro Parabólico - Sistemas de Cómputo Paralelo y Distribuido\n"
         "Tercer Parcial 2025\n"
         "Dr. J. Jesús Arellano Pimentel");
@@ -843,18 +1052,12 @@ void on_btnAcercaDe_clicked() {
     gtk_widget_destroy(dialog);
 }
 
-/**
- * Callback para el botón de salir
- */
 void on_btnSalir_clicked() { 
-    servidor_activo = 0;
+    limpiar_recursos_aplicacion();
     gtk_main_quit(); 
 }
 
-/**
- * Callback para el cierre de ventana
- */
 void on_window_destroy() { 
-    servidor_activo = 0;
+    limpiar_recursos_aplicacion();
     gtk_main_quit(); 
 }
