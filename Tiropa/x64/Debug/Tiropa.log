@@ -1,2 +1,9 @@
 ﻿  Tiropa.cpp
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(516,74): warning C4267: 'argumento': conversión de 'size_t' a 'int'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(728,33): warning C4244: 'inicializando': conversión de 'double' a 'float'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(729,33): warning C4244: 'inicializando': conversión de 'double' a 'float'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(770,98): warning C4267: 'argumento': conversión de 'size_t' a 'int'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(830,106): warning C4267: 'argumento': conversión de 'size_t' a 'int'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(859,92): warning C4267: 'argumento': conversión de 'size_t' a 'int'; posible pérdida de datos
+E:\Documentos\Proyectos Visual Studio\Tiropa\Tiropa.cpp(1200,1): warning C4715: 'AcercaDe': no todas las rutas de acceso de control devuelven un valor
   Tiropa.vcxproj -> E:\Documentos\Proyectos Visual Studio\Tiropa\x64\Debug\Tiropa.exe

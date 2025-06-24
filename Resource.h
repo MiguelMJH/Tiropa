@@ -2,21 +2,28 @@
 // Microsoft Visual C++ generated include file.
 // Used by Tiropa.rc
 
-#define IDS_APP_TITLE			103
+#define IDS_APP_TITLE				103
 
-#define IDR_MAINFRAME			128
-#define IDD_TIROPA_DIALOG	102
-#define IDD_ABOUTBOX			103
-#define IDM_ABOUT				104
-#define IDM_EXIT				105
-#define IDI_TIROPA			107
-#define IDI_SMALL				108
-#define IDC_TIROPA			109
-#define IDC_MYICON				2
+#define IDR_MAINFRAME				128
+#define IDD_TIROPA_DIALOG			102
+#define IDD_ABOUTBOX				103
+#define IDM_ABOUT					104
+#define IDM_EXIT					105
+#define IDI_TIROPA					107
+#define IDI_SMALL					108
+#define IDC_TIROPA					109
+#define IDC_MYICON					2
 #ifndef IDC_STATIC
-#define IDC_STATIC				-1
-#define IDB_PERSONAJE 101
-#define IDB_COMER     102
+#define IDC_STATIC					-1
+#define IDB_PERSONAJE				101
+#define IDB_COMER					102
+
+// IDs de controles de interfaz
+#define ID_BOTON_DISPARAR			3
+#define ID_CAMPO_ANGULO				2
+#define ID_CAMPO_VELOCIDAD			4
+#define ID_CAMPO_DIRECCION_IP		5
+#define ID_CAMPO_NOMBRE_JUGADOR		6
 #endif
 // Next default values for new objects
 //

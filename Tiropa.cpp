@@ -1,15 +1,10 @@
-﻿// Tiropa.cpp : Juego de tiro parabólico multijugador
-// Sistema de colisiones mejorado: rectángulo vs rectángulo
-
+﻿// Tiropa.cpp : Juego de tiro parabólico multijugador con soporte para múltiples proyectiles simultáneos
 #include "framework.h"
 #include "Tiropa.h"
 #include <windows.h>
 #include "resource.h"
 #include <time.h>
 #include <math.h>
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 #include <commctrl.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,946 +12,1189 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "Mswsock.lib")
+#pragma comment(lib, "AdvApi32.lib")
+#pragma comment(lib, "Msimg32.lib")
 
-// Constantes del juego
-#define MAX_LOADSTRING 100
-#define G 9.8f                          // Aceleración gravitacional
-#define PUERTO_SERVIDOR 4200            // Puerto TCP para comunicación
-#define ANCHO_PERSONAJE 50              // Dimensiones del personaje
-#define ALTO_PERSONAJE 40
-#define TAM_BOLA 30                     // Tamaño del proyectil
-#define MAX_ALIAS 32                    // Longitud máxima del nombre
-#define MAX_PROYECTILES 10              // Máximo proyectiles simultáneos
-#define ANCHO_JUEGO 1080                // Área de juego
-#define ALTO_JUEGO 720
-#define ALTO_CONTROLES 40               // Espacio para controles UI
-#define ANCHO_VENTANA (ANCHO_JUEGO + 20)
-#define ALTO_VENTANA (ALTO_JUEGO + ALTO_CONTROLES + 60)
-#define TIMER_INTERVAL 20               // Intervalo del timer (50 FPS)
-#define TIMEOUT_SEGUNDOS 3              // Timeout de red
-#define ESCALA_VISUAL 3.0               // Factor de escala visual
-#define VELOCIDAD_VISUAL_CONSTANTE 150.0 // Velocidad visual normalizada
-#define DELTA_T 0.02                    // Delta de tiempo para física
+// Constantes físicas y de sistema
+#define MAX_CADENA 100
+#define ID_TEMPORIZADOR 1
+#define PI 3.14159265
+#define FUERZA_GRAVEDAD 9.8
+#define DELTA_TIEMPO 0.3
+#define PUERTO_RED "4200"
+#define SLEEP_TIME 20  // Tiempo de refresco en milisegundos
+#define MAX_PROYECTILES_SIMULTANEOS 50  // Máximo de proyectiles remotos simultáneos
+#define MAX_CONEXIONES_SIMULTANEAS 20   // Máximo de conexiones TCP simultáneas
 
-// Estructura de datos de red - compatible con otros proyectos
-typedef struct {
-    double x, y, xo, yo;                // Posición actual y origen
-    double vo, ang;                     // Velocidad inicial y ángulo
-    double to;                          // Tiempo inicial
-    char NN[MAX_ALIAS];                 // Nombre del jugador
-} Datos;
+// Estructura para coordenadas de plataformas del juego
+struct CoordenadasPlataforma {
+    int x1, x2, y1, y2;
+};
 
-// Estructura interna del proyectil
-typedef struct {
-    CRITICAL_SECTION mutex;             // Sincronización de hilos
-    double x, y;                        // Posición actual
-    double pos_x, pos_y;                // Posición inicial
-    double vel_x, vel_y;                // Velocidades componentes
-    double tiempo_ini;                  // Tiempo transcurrido
-    char remitente[MAX_ALIAS];          // Quien disparó
-    BOOL activo;                        // Estado del proyectil
-    BOOL es_local;                      // Proyectil propio o remoto
-} DatosProyectil;
+// Estructura para posición del personaje jugador
+struct PosicionPersonaje {
+    int x, y;
+};
 
-// Estructura de las barras del juego
-typedef struct {
-    int x, y, ancho, alto;              // Dimensiones y posición
-    BOOL visible;                       // Estado de visibilidad
-} BarraJuego;
+// Estructura de datos para transmisión de red entre clientes
+struct DatosTransmision {
+    double x, y, velocidadInicialX, velocidadInicialY;
+    double velocidadTotal, anguloRadianes;
+    double tiempoTranscurrido;
+    char nombreJugador[32] = "jugador1";
+    DWORD timestampCreacion;  // Timestamp para identificar proyectiles únicos
+};
+typedef struct DatosTransmision DATOS_RED;
 
-// Variables globales del sistema
-HINSTANCE hInst;
-WCHAR szTitle[MAX_LOADSTRING];
-WCHAR szWindowClass[MAX_LOADSTRING];
+// Estructura para cálculos físicos internos del proyectil
+struct CalculosFisicos {
+    double velocidadX = 0.0, velocidadY = 0.0;
+    double velocidadTotal = 0.0;
+    double anguloRadianes = 0.0;
+    double tiempo = 0.0;
+    double posicionX, posicionY;
+};
+typedef struct CalculosFisicos FISICA_INTERNA;
 
-// Variables de red
-SOCKET serverSocket = INVALID_SOCKET;
-BOOL serverActivo = TRUE;
-BOOL aplicacionCerrando = FALSE;
-HWND hWndGlobal = NULL;
-char alias_jugador[MAX_ALIAS] = "jugador1";
+// Estructura principal del proyectil con lista enlazada mejorada
+typedef struct ProyectilJuego {
+    double posicionInicialX, posicionInicialY;
+    double velocidadMovimientoX, velocidadMovimientoY;
+    double tiempoVida;
+    double velocidadLanzamiento;
+    double anguloDisparo;
+    char nombrePropietario[32] = "jugador1";
+    SOCKET socketConexion;
+    BOOL estaVisible;
+    BOOL esLocal;  // Distinguir entre proyectiles locales y remotos
+    DWORD idUnico;  // ID único para evitar duplicados
+    DWORD timestampCreacion;  // Timestamp de creación
+    struct ProyectilJuego* siguiente;
+    struct ProyectilJuego* anterior;
+} ProyectilJuego;
 
-// Área de juego
-RECT gameArea = { 10, ALTO_CONTROLES + 10, ANCHO_JUEGO + 10, ALTO_JUEGO + ALTO_CONTROLES + 10 };
+// Variables globales de la aplicación
+HINSTANCE instanciaApp;
+WCHAR tituloVentana[MAX_CADENA];
+WCHAR claseVentana[MAX_CADENA];
 
-// Recursos gráficos
-HBITMAP hBmpPersonaje = NULL;
-HBITMAP hBmpBola = NULL;
+// Variables de proyectiles y sincronización mejoradas
+ProyectilJuego* proyectilLocal = NULL;
+ProyectilJuego* listaProyectilesRemotos = NULL;
+HANDLE mutexSincronizacion;
+HANDLE mutexContadores;  // Mutex adicional para contadores
+BOOL temporizadorActivo = FALSE;
+BOOL disparoTransmitido = FALSE;
 
-// Estado del personaje
-int personaje_x = 0;
-int personaje_y = 0;
-int personaje_barra_actual = -1;        // Índice de barra donde está (-1 = suelo)
-BarraJuego barras[3];                   // Tres barras del juego
-BOOL personaje_destruido = FALSE;
-BOOL tiro_en_progreso = FALSE;
+// Contadores para gestión de recursos
+int contadorProyectilesRemotos = 0;
+int contadorConexionesActivas = 0;
+DWORD contadorIDsUnicos = 1;
 
-// Sistema de proyectiles
-DatosProyectil proyectiles[MAX_PROYECTILES];
-CRITICAL_SECTION mutex_proyectiles;
-int num_proyectiles = 0;
+// Controles de la interfaz de usuario
+HWND campoNombre, campoAngulo, campoVelocidad, campoDireccionIP, botonDisparar;
 
-// Controles de interfaz
-HWND hEditVelocidad = NULL;
-HWND hEditAngulo = NULL;
-HWND hEditIP = NULL;
-HWND hEditNombre = NULL;
-HWND hBtnDisparar = NULL;
+// Recursos gráficos (bitmaps)
+HBITMAP imagenProyectil, imagenPersonaje;
+BITMAP informacionBitmap;
 
-// Double buffering
-HDC hMemDC = NULL;
-HBITMAP hMemBitmap = NULL;
-HBITMAP hOldBitmap = NULL;
+// Estado actual del juego
+CoordenadasPlataforma coordenadasPlataformas[3];
+bool plataformaActiva[3] = { true, true, true };
+PosicionPersonaje posicionJugador;
+FISICA_INTERNA calculosLocales;
+DATOS_RED datosEnvio, datosRecepcion;
 
-// Hilo del servidor
-HANDLE hServidorThread = NULL;
+// Variables de posicionamiento y dimensiones
+int posicionInicialX, posicionInicialY;
+int anchoVentana, altoVentana, anchoProyectil, altoProyectil;
+HWND ventanaPrincipal;
+int indicePlataformaJugador = -1;
 
-// Prototipos de funciones
-ATOM MyRegisterClass(HINSTANCE hInstance);
-BOOL InitInstance(HINSTANCE, int);
-LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
+// Variables de comunicación de red
+SOCKET socketServidor = INVALID_SOCKET;
+BOOL servidorEnFuncionamiento = TRUE;
+BOOL aplicacionTerminando = FALSE;
+char nombreJugadorActual[32] = "jugador1";
 
-// Funciones del juego
-void InicializarJuego(HWND hWnd);
-void InicializarBarrasAleatorias();
-void PosicionarPersonajeSobreBarraAleatoria();
-void DibujarJuego(HDC hdc);
-void DibujarBitmap(HDC hdcDestino, HBITMAP hBitmap, int x, int y);
-void ActualizarProyectiles();
-void VerificarGravedadPersonaje();
-void LimpiarProyectiles();
-BOOL ValidarDatosEntrada();
-
-// Funciones de red TCP
-void EnviarDatosTCP(const char* ipDestino, const Datos* datos);
-DWORD WINAPI ServidorTCPThread(LPVOID param);
-DWORD WINAPI ClienteTCPThread(LPVOID param);
-DWORD WINAPI AtenderClienteThread(LPVOID param);
-void ProcesarDatosRecibidos(const Datos* datos);
-
-// Funciones de proyectiles
-int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, const char* remitente);
-void EliminarProyectil(int index);
-void ActualizarProyectil(int index);
-
-// Funciones de utilidad
-void LimpiarRecursos();
-void CerrarAplicacion();
-BOOL ColisionaConBarra(double x, double y, const BarraJuego* barra);
-BOOL ColisionaRectangulos(double x1, double y1, double w1, double h1,
-    double x2, double y2, double w2, double h2);
-BOOL ColisionaConPersonaje(double proj_x, double proj_y);
-void FinalizarPartida(const char* remitente);
-
-// Implementación de funciones
-
-// Inicializa el sistema de juego
-void InicializarJuego(HWND hWnd) {
-    InitializeCriticalSection(&mutex_proyectiles);
-
-    // Inicializar array de proyectiles
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        proyectiles[i].activo = FALSE;
-        InitializeCriticalSection(&proyectiles[i].mutex);
-    }
-
-    // Cargar recursos gráficos
-    hBmpPersonaje = LoadBitmap(hInst, MAKEINTRESOURCE(IDB_PERSONAJE));
-    hBmpBola = LoadBitmap(hInst, MAKEINTRESOURCE(IDB_COMER));
-
-    if (!hBmpPersonaje || !hBmpBola) {
-        MessageBoxA(hWnd, "Error cargando imagenes del juego", "Error", MB_OK | MB_ICONERROR);
-    }
-
-    // Configurar elementos del juego
-    InicializarBarrasAleatorias();
-    PosicionarPersonajeSobreBarraAleatoria();
-
-    // Configurar double buffering
-    HDC hdc = GetDC(hWnd);
-    hMemDC = CreateCompatibleDC(hdc);
-    hMemBitmap = CreateCompatibleBitmap(hdc, ANCHO_JUEGO, ALTO_JUEGO);
-    hOldBitmap = (HBITMAP)SelectObject(hMemDC, hMemBitmap);
-    ReleaseDC(hWnd, hdc);
-
-    // Iniciar servidor TCP
-    hServidorThread = CreateThread(NULL, 0, ServidorTCPThread, hWnd, 0, NULL);
-
-    // Iniciar timer del juego
-    SetTimer(hWnd, 1, TIMER_INTERVAL, NULL);
+// Función para generar ID único para proyectiles
+DWORD GenerarIDUnico() {
+    WaitForSingleObject(mutexContadores, INFINITE);
+    DWORD id = contadorIDsUnicos++;
+    ReleaseMutex(mutexContadores);
+    return id;
 }
 
-// Genera posiciones aleatorias para las barras
-void InicializarBarrasAleatorias() {
-    srand((unsigned int)GetTickCount());
-
-    const int anchoBarra = 70;
-    const int anchoTotal = anchoBarra * 3;
-    int maxBaseX = (ANCHO_JUEGO / 2) - anchoTotal;
-
-    if (maxBaseX < 0) maxBaseX = 0;
-    int baseX = maxBaseX > 0 ? rand() % (maxBaseX + 1) : 0;
-
-    for (int i = 0; i < 3; i++) {
-        barras[i].ancho = anchoBarra;
-        barras[i].alto = 50 + (ALTO_JUEGO > 100 ? rand() % (ALTO_JUEGO / 2 - 50) : 50);
-        barras[i].x = gameArea.left + baseX + i * anchoBarra;
-        barras[i].y = gameArea.bottom - barras[i].alto;
-        barras[i].visible = TRUE;
-    }
-}
-
-// Coloca el personaje sobre una barra aleatoria
-void PosicionarPersonajeSobreBarraAleatoria() {
-    if (!hBmpPersonaje) return;
-
-    int barraSeleccionada = rand() % 3;
-
-    // Centrar horizontalmente en la barra
-    personaje_x = barras[barraSeleccionada].x + (barras[barraSeleccionada].ancho - ANCHO_PERSONAJE) / 2;
-
-    // Posicionar encima de la barra con separación
-    personaje_y = barras[barraSeleccionada].y - ALTO_PERSONAJE - 10;
-
-    // Verificar límites del área de juego
-    if (personaje_y < gameArea.top) {
-        personaje_y = gameArea.top;
-    }
-
-    personaje_barra_actual = barraSeleccionada;
-}
-
-// Verifica si el personaje debe caer por destrucción de barra
-void VerificarGravedadPersonaje() {
-    if (personaje_destruido) return;
-
-    // Si está en una barra específica
-    if (personaje_barra_actual >= 0 && personaje_barra_actual < 3) {
-        // Verificar si la barra fue destruida
-        if (!barras[personaje_barra_actual].visible) {
-            // Hacer caer al suelo
-            personaje_y = gameArea.bottom - ALTO_PERSONAJE - 20;
-            personaje_barra_actual = -1;
+// Función para verificar si un proyectil ya existe (evitar duplicados)
+BOOL ProyectilYaExiste(DWORD idUnico, DWORD timestamp) {
+    ProyectilJuego* actual = listaProyectilesRemotos;
+    while (actual != NULL) {
+        if (actual->idUnico == idUnico && actual->timestampCreacion == timestamp) {
+            return TRUE;
         }
+        actual = actual->siguiente;
     }
+    return FALSE;
 }
 
-// Dibuja un bitmap en el contexto especificado
-void DibujarBitmap(HDC hdcDestino, HBITMAP hBitmap, int x, int y) {
-    if (!hBitmap) return;
-
-    BITMAP bmp;
-    if (!GetObject(hBitmap, sizeof(BITMAP), &bmp)) return;
-
-    HDC hdcMem = CreateCompatibleDC(hdcDestino);
-    if (!hdcMem) return;
-
-    HBITMAP hOldBmp = (HBITMAP)SelectObject(hdcMem, hBitmap);
-    BitBlt(hdcDestino, x, y, bmp.bmWidth, bmp.bmHeight, hdcMem, 0, 0, SRCCOPY);
-    SelectObject(hdcMem, hOldBmp);
-    DeleteDC(hdcMem);
-}
-
-// Renderiza todos los elementos del juego
-void DibujarJuego(HDC hdc) {
-    // Limpiar fondo
-    RECT rect = { 0, 0, ANCHO_JUEGO, ALTO_JUEGO };
-    HBRUSH hBrushFondo = CreateSolidBrush(RGB(255, 255, 255));
-    FillRect(hdc, &rect, hBrushFondo);
-    DeleteObject(hBrushFondo);
-
-    // Dibujar barras
-    HBRUSH hBarBrush = CreateSolidBrush(RGB(76, 76, 255));
-    for (int i = 0; i < 3; i++) {
-        if (!barras[i].visible) continue;
-
-        RECT barRect = {
-            barras[i].x - gameArea.left,
-            barras[i].y - gameArea.top,
-            barras[i].x - gameArea.left + barras[i].ancho,
-            barras[i].y - gameArea.top + barras[i].alto
-        };
-        FillRect(hdc, &barRect, hBarBrush);
-    }
-    DeleteObject(hBarBrush);
-
-    // Dibujar personaje
-    if (!personaje_destruido && hBmpPersonaje) {
-        DibujarBitmap(hdc, hBmpPersonaje,
-            personaje_x - gameArea.left,
-            personaje_y - gameArea.top);
-    }
-
-    // Dibujar proyectiles
-    EnterCriticalSection(&mutex_proyectiles);
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        if (!proyectiles[i].activo) continue;
-
-        EnterCriticalSection(&proyectiles[i].mutex);
-        double x = proyectiles[i].x - gameArea.left;
-        double y = proyectiles[i].y - gameArea.top;
-        LeaveCriticalSection(&proyectiles[i].mutex);
-
-        // Solo dibujar si está en área visible
-        if (x >= -TAM_BOLA && x <= ANCHO_JUEGO + TAM_BOLA &&
-            y >= -TAM_BOLA && y <= ALTO_JUEGO + TAM_BOLA) {
-
-            DibujarBitmap(hdc, hBmpBola,
-                (int)(x - TAM_BOLA / 2),
-                (int)(y - TAM_BOLA / 2));
-        }
-    }
-    LeaveCriticalSection(&mutex_proyectiles);
-}
-
-// Crea un nuevo proyectil en el sistema
-int CrearProyectil(double x, double y, double vo, double ang, BOOL es_local, const char* remitente) {
-    EnterCriticalSection(&mutex_proyectiles);
-
-    // Buscar slot libre
-    int index = -1;
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        if (!proyectiles[i].activo) {
-            index = i;
-            break;
-        }
-    }
-
-    if (index == -1) {
-        LeaveCriticalSection(&mutex_proyectiles);
-        return -1;
-    }
-
-    DatosProyectil* p = &proyectiles[index];
-
-    // Inicializar proyectil
-    EnterCriticalSection(&p->mutex);
-    p->pos_x = x;
-    p->pos_y = y;
-    p->x = x;
-    p->y = y;
-    p->vel_x = vo * cos(ang);
-    p->vel_y = vo * sin(ang);
-    p->tiempo_ini = 0.0;
-    p->activo = TRUE;
-    p->es_local = es_local;
-
-    if (remitente) {
-        strncpy_s(p->remitente, sizeof(p->remitente), remitente, _TRUNCATE);
-    }
-    else {
-        strcpy_s(p->remitente, sizeof(p->remitente), alias_jugador);
-    }
-    LeaveCriticalSection(&p->mutex);
-
-    num_proyectiles++;
-    LeaveCriticalSection(&mutex_proyectiles);
-
-    return index;
-}
-
-// Elimina un proyectil del sistema
-void EliminarProyectil(int index) {
-    if (index < 0 || index >= MAX_PROYECTILES) return;
-
-    EnterCriticalSection(&mutex_proyectiles);
-    if (proyectiles[index].activo) {
-        proyectiles[index].activo = FALSE;
-        num_proyectiles--;
-    }
-    LeaveCriticalSection(&mutex_proyectiles);
-}
-
-// Detección de colisión rectángulo vs rectángulo
-BOOL ColisionaRectangulos(double x1, double y1, double w1, double h1,
-    double x2, double y2, double w2, double h2) {
-    return !(x1 + w1 <= x2 || x2 + w2 <= x1 || y1 + h1 <= y2 || y2 + h2 <= y1);
-}
-
-// Verifica colisión del proyectil con una barra
-BOOL ColisionaConBarra(double x, double y, const BarraJuego* barra) {
-    return ColisionaRectangulos(
-        x - TAM_BOLA / 2, y - TAM_BOLA / 2, TAM_BOLA, TAM_BOLA,  // Proyectil
-        barra->x, barra->y, barra->ancho, barra->alto        // Barra
-    );
-}
-
-// Verifica colisión del proyectil con el personaje
-BOOL ColisionaConPersonaje(double proj_x, double proj_y) {
-    return ColisionaRectangulos(
-        proj_x - TAM_BOLA / 2, proj_y - TAM_BOLA / 2, TAM_BOLA, TAM_BOLA,  // Proyectil
-        personaje_x, personaje_y, ANCHO_PERSONAJE, ALTO_PERSONAJE      // Personaje
-    );
-}
-
-// Actualiza la física y colisiones de un proyectil
-void ActualizarProyectil(int index) {
-    if (index < 0 || index >= MAX_PROYECTILES) return;
-
-    DatosProyectil* p = &proyectiles[index];
-    if (!p->activo) return;
-
-    EnterCriticalSection(&p->mutex);
-
-    // Calcular velocidad normalizada para movimiento visual constante
-    double velocidad_total = sqrt(p->vel_x * p->vel_x + p->vel_y * p->vel_y);
-    double factor_normalizacion = VELOCIDAD_VISUAL_CONSTANTE / velocidad_total;
-
-    double vel_x_visual = p->vel_x * factor_normalizacion;
-    double vel_y_visual = p->vel_y * factor_normalizacion;
-
-    // Calcular nueva posición según física parabólica
-    if (p->es_local) {
-        // Proyectil local - movimiento normal
-        p->x = p->pos_x + vel_x_visual * p->tiempo_ini * ESCALA_VISUAL;
-        p->y = p->pos_y - (vel_y_visual * p->tiempo_ini -
-            0.5 * G * factor_normalizacion * p->tiempo_ini * p->tiempo_ini) * ESCALA_VISUAL;
-    }
-    else {
-        // Proyectil remoto - efecto espejo horizontal
-        p->x = p->pos_x + vel_x_visual * p->tiempo_ini * ESCALA_VISUAL;
-        p->x = (2 * gameArea.right) - p->x;
-        p->y = p->pos_y - (vel_y_visual * p->tiempo_ini -
-            0.5 * G * factor_normalizacion * p->tiempo_ini * p->tiempo_ini) * ESCALA_VISUAL;
-    }
-
-    p->tiempo_ini += DELTA_T;
-
-    double x = p->x;
-    double y = p->y;
-
-    LeaveCriticalSection(&p->mutex);
-
-    // Verificar límites del área de juego
-    if (y >= gameArea.bottom ||
-        (p->es_local && x > gameArea.right + TAM_BOLA) ||
-        (!p->es_local && x < gameArea.left - TAM_BOLA)) {
-
-        // Si es proyectil local que sale por la derecha, enviarlo por red
-        if (p->es_local && x > gameArea.right + TAM_BOLA) {
-            Datos* datos = (Datos*)malloc(sizeof(Datos));
-            if (datos) {
-                datos->x = x;
-                datos->y = y;
-                datos->xo = p->pos_x;
-                datos->yo = p->pos_y;
-                datos->vo = sqrt(p->vel_x * p->vel_x + p->vel_y * p->vel_y);
-                datos->ang = atan2(p->vel_y, p->vel_x);
-                datos->to = p->tiempo_ini;
-                strcpy_s(datos->NN, sizeof(datos->NN), alias_jugador);
-
-                CreateThread(NULL, 0, ClienteTCPThread, datos, 0, NULL);
-            }
-        }
-
-        EliminarProyectil(index);
-        return;
-    }
-
-    // Solo proyectiles remotos verifican colisiones
-    if (!p->es_local) {
-        // Verificar colisión con barras
-        for (int i = 0; i < 3; i++) {
-            if (!barras[i].visible) continue;
-
-            if (ColisionaConBarra(x, y, &barras[i])) {
-                barras[i].visible = FALSE;
-                EliminarProyectil(index);
-                return;
-            }
-        }
-
-        // Verificar colisión con personaje - MEJORADA
-        if (!personaje_destruido) {
-            if (ColisionaConPersonaje(x, y)) {
-                EliminarProyectil(index);
-                FinalizarPartida(p->remitente);
-                return;
-            }
-        }
-    }
-}
-
-// Actualiza todos los proyectiles activos
-void ActualizarProyectiles() {
-    if (aplicacionCerrando) return;
-
-    VerificarGravedadPersonaje();
-
-    // Actualizar cada proyectil
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        if (proyectiles[i].activo) {
-            ActualizarProyectil(i);
-        }
-    }
-
-    // Verificar si se puede habilitar el botón de disparo
-    BOOL hayProyectilLocal = FALSE;
-    EnterCriticalSection(&mutex_proyectiles);
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        if (proyectiles[i].activo && proyectiles[i].es_local) {
-            hayProyectilLocal = TRUE;
-            break;
-        }
-    }
-    LeaveCriticalSection(&mutex_proyectiles);
-
-    if (!hayProyectilLocal && tiro_en_progreso) {
-        tiro_en_progreso = FALSE;
-        if (hBtnDisparar && IsWindow(hBtnDisparar)) {
-            EnableWindow(hBtnDisparar, TRUE);
-        }
-    }
-}
-
-// Finaliza la partida cuando el personaje es destruido
-void FinalizarPartida(const char* remitente) {
-    personaje_destruido = TRUE;
-
-    char mensaje[256];
-    sprintf_s(mensaje, sizeof(mensaje),
-        "¡Tu personaje ha sido destruido por %s!\nLa aplicación se cerrará.", remitente);
-
-    MessageBoxA(hWndGlobal, mensaje, "Fin del juego", MB_OK | MB_ICONINFORMATION);
-
-    CerrarAplicacion();
-    ExitProcess(0);
-}
-
-// Cierra la aplicación de forma segura
-void CerrarAplicacion() {
-    aplicacionCerrando = TRUE;
-    serverActivo = FALSE;
-
-    if (hWndGlobal && IsWindow(hWndGlobal)) {
-        KillTimer(hWndGlobal, 1);
-    }
-
-    if (serverSocket != INVALID_SOCKET) {
-        shutdown(serverSocket, SD_BOTH);
-        closesocket(serverSocket);
-        serverSocket = INVALID_SOCKET;
-    }
-
-    if (hServidorThread) {
-        DWORD waitResult = WaitForSingleObject(hServidorThread, 1000);
-        if (waitResult == WAIT_TIMEOUT) {
-            TerminateThread(hServidorThread, 0);
-        }
-        CloseHandle(hServidorThread);
-        hServidorThread = NULL;
-    }
-
-    LimpiarRecursos();
-
-    if (hWndGlobal && IsWindow(hWndGlobal)) {
-        DestroyWindow(hWndGlobal);
-    }
-
-    PostQuitMessage(0);
-    Sleep(100);
-    ExitProcess(0);
-}
-
-// Envía datos por TCP - protocolo limpio
-void EnviarDatosTCP(const char* ipDestino, const Datos* datos) {
-    if (!ipDestino || strlen(ipDestino) == 0 || aplicacionCerrando) return;
-
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return;
-
-    DWORD timeout = TIMEOUT_SEGUNDOS * 1000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-
-    sockaddr_in servidor = { 0 };
-    servidor.sin_family = AF_INET;
-    servidor.sin_port = htons(PUERTO_SERVIDOR);
-
-    if (inet_pton(AF_INET, ipDestino, &servidor.sin_addr) == 1) {
-        if (connect(s, (sockaddr*)&servidor, sizeof(servidor)) == 0) {
-            // Solo enviar estructura Datos
-            send(s, (const char*)datos, sizeof(Datos), 0);
-        }
-    }
-
-    closesocket(s);
-}
-
-// Hilo cliente TCP
-DWORD WINAPI ClienteTCPThread(LPVOID param) {
-    Datos* datos = (Datos*)param;
-
-    if (!aplicacionCerrando && hEditIP && IsWindow(hEditIP)) {
-        TCHAR bufferIP[32];
-        GetWindowText(hEditIP, bufferIP, 32);
-        char ipDestino[32];
-        size_t converted = 0;
-        wcstombs_s(&converted, ipDestino, sizeof(ipDestino), bufferIP, _TRUNCATE);
-
-        EnviarDatosTCP(ipDestino, datos);
-    }
-
-    if (datos) {
-        free(datos);
-    }
-    return 0;
-}
-
-// Atiende conexiones de clientes TCP
-DWORD WINAPI AtenderClienteThread(LPVOID param) {
-    SOCKET clientSocket = (SOCKET)(uintptr_t)param;
-
-    Datos datos = { 0 };
-    int bytesRecibidos = recv(clientSocket, (char*)&datos, sizeof(Datos), 0);
-
-    if (bytesRecibidos == sizeof(Datos) && !aplicacionCerrando) {
-        ProcesarDatosRecibidos(&datos);
-    }
-
-    closesocket(clientSocket);
-    return 0;
-}
-
-// Hilo servidor TCP principal
-DWORD WINAPI ServidorTCPThread(LPVOID param) {
-    HWND hWnd = (HWND)param;
-
-    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket == INVALID_SOCKET) return 0;
-
-    BOOL reuseAddr = TRUE;
-    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
-
-    sockaddr_in local = { 0 };
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port = htons(PUERTO_SERVIDOR);
-
-    if (bind(serverSocket, (sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
-        closesocket(serverSocket);
-        serverSocket = INVALID_SOCKET;
-        return 0;
-    }
-
-    if (listen(serverSocket, 10) == SOCKET_ERROR) {
-        closesocket(serverSocket);
-        serverSocket = INVALID_SOCKET;
-        return 0;
-    }
-
-    while (serverActivo && !aplicacionCerrando) {
-        sockaddr_in cliente = { 0 };
-        int len = sizeof(cliente);
-
-        SOCKET clientSocket = accept(serverSocket, (sockaddr*)&cliente, &len);
-
-        if (clientSocket != INVALID_SOCKET && !aplicacionCerrando) {
-            CreateThread(NULL, 0, AtenderClienteThread, (LPVOID)(uintptr_t)clientSocket, 0, NULL);
-        }
-        else if (clientSocket == INVALID_SOCKET) {
-            int error = WSAGetLastError();
-            if (error == WSAEWOULDBLOCK) {
-                Sleep(50);
-                continue;
+// Función para limpiar proyectiles remotos inactivos
+void LimpiarProyectilesInactivos() {
+    WaitForSingleObject(mutexSincronizacion, INFINITE);
+
+    ProyectilJuego* actual = listaProyectilesRemotos;
+    while (actual != NULL) {
+        ProyectilJuego* siguiente = actual->siguiente;
+
+        if (!actual->estaVisible) {
+            // Eliminar de la lista
+            if (actual->anterior) {
+                actual->anterior->siguiente = actual->siguiente;
             }
             else {
-                break;
+                listaProyectilesRemotos = actual->siguiente;
             }
+
+            if (actual->siguiente) {
+                actual->siguiente->anterior = actual->anterior;
+            }
+
+            // Cerrar socket si está abierto
+            if (actual->socketConexion != INVALID_SOCKET) {
+                shutdown(actual->socketConexion, SD_BOTH);
+                closesocket(actual->socketConexion);
+            }
+
+            free(actual);
+            contadorProyectilesRemotos--;
         }
+
+        actual = siguiente;
     }
 
-    if (serverSocket != INVALID_SOCKET) {
-        closesocket(serverSocket);
-        serverSocket = INVALID_SOCKET;
-    }
-
-    return 0;
+    ReleaseMutex(mutexSincronizacion);
 }
 
-// Procesa datos recibidos de la red
-void ProcesarDatosRecibidos(const Datos* datos) {
-    if (!aplicacionCerrando) {
-        CrearProyectil(datos->xo, datos->yo, datos->vo, datos->ang, FALSE, datos->NN);
-    }
-}
+// Función para terminar la aplicación de forma segura
+void TerminarJuegoCompleto() {
+    aplicacionTerminando = TRUE;
+    servidorEnFuncionamiento = FALSE;
 
-// Valida los datos de entrada del usuario
-BOOL ValidarDatosEntrada() {
-    TCHAR bufferVel[16], bufferAng[16], bufferIP[32];
-    GetWindowText(hEditVelocidad, bufferVel, 16);
-    GetWindowText(hEditAngulo, bufferAng, 16);
-    GetWindowText(hEditIP, bufferIP, 32);
+    if (ventanaPrincipal) KillTimer(ventanaPrincipal, ID_TEMPORIZADOR);
 
-    if (wcslen(bufferVel) == 0 || wcslen(bufferAng) == 0 || wcslen(bufferIP) == 0) {
-        MessageBox(hWndGlobal, L"Debe rellenar todas las casillas.", L"Campos vacíos", MB_OK | MB_ICONWARNING);
-        return FALSE;
+    // Limpiar todos los proyectiles remotos
+    LimpiarProyectilesInactivos();
+
+    if (socketServidor != INVALID_SOCKET) {
+        shutdown(socketServidor, SD_BOTH);
+        closesocket(socketServidor);
+        socketServidor = INVALID_SOCKET;
     }
 
-    double vel = _wtof(bufferVel);
-    double angDeg = _wtof(bufferAng);
-
-    if (vel <= 0 || vel > 1000) {
-        MessageBox(hWndGlobal, L"La velocidad debe estar entre 1 y 1000.", L"Velocidad inválida", MB_OK | MB_ICONERROR);
-        return FALSE;
+    if (mutexSincronizacion) {
+        CloseHandle(mutexSincronizacion);
+        mutexSincronizacion = NULL;
     }
 
-    if (angDeg <= 0 || angDeg >= 90) {
-        MessageBox(hWndGlobal, L"El ángulo debe estar entre 1 y 89 grados.", L"Ángulo inválido", MB_OK | MB_ICONERROR);
-        return FALSE;
-    }
-
-    if (wcsstr(bufferIP, L".") == NULL) {
-        MessageBox(hWndGlobal, L"Dirección IP inválida.", L"IP incorrecta", MB_OK | MB_ICONERROR);
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-// Limpia todos los proyectiles activos
-void LimpiarProyectiles() {
-    EnterCriticalSection(&mutex_proyectiles);
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        proyectiles[i].activo = FALSE;
-    }
-    num_proyectiles = 0;
-    LeaveCriticalSection(&mutex_proyectiles);
-}
-
-// Libera todos los recursos del sistema
-void LimpiarRecursos() {
-    LimpiarProyectiles();
-
-    for (int i = 0; i < MAX_PROYECTILES; i++) {
-        DeleteCriticalSection(&proyectiles[i].mutex);
-    }
-    DeleteCriticalSection(&mutex_proyectiles);
-
-    if (hBmpPersonaje) {
-        DeleteObject(hBmpPersonaje);
-        hBmpPersonaje = NULL;
-    }
-    if (hBmpBola) {
-        DeleteObject(hBmpBola);
-        hBmpBola = NULL;
-    }
-
-    if (hMemDC) {
-        SelectObject(hMemDC, hOldBitmap);
-        DeleteObject(hMemBitmap);
-        DeleteDC(hMemDC);
-        hMemDC = NULL;
-    }
-}
-
-// Punto de entrada principal de la aplicación
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR lpCmdLine,
-    _In_ int nCmdShow)
-{
-    UNREFERENCED_PARAMETER(hPrevInstance);
-
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        MessageBox(NULL, L"Error inicializando Winsock", L"Error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
-    LoadStringW(hInstance, IDC_TIROPA, szWindowClass, MAX_LOADSTRING);
-    MyRegisterClass(hInstance);
-
-    if (!InitInstance(hInstance, nCmdShow)) {
-        WSACleanup();
-        return FALSE;
-    }
-
-    HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_TIROPA));
-    MSG msg;
-
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
+    if (mutexContadores) {
+        CloseHandle(mutexContadores);
+        mutexContadores = NULL;
     }
 
     WSACleanup();
-    return (int)msg.wParam;
+    TerminateProcess(GetCurrentProcess(), 0);
 }
 
-// Registra la clase de ventana
-ATOM MyRegisterClass(HINSTANCE hInstance)
-{
-    WNDCLASSEXW wcex = { 0 };
+// Prototipos de funciones principales
+ATOM RegistrarClaseVentana(HINSTANCE instancia);
+BOOL InicializarInstancia(HINSTANCE, int);
+LRESULT CALLBACK ProcedimientoVentana(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK AcercaDe(HWND, UINT, WPARAM, LPARAM);
 
-    wcex.cbSize = sizeof(WNDCLASSEX);
-    wcex.style = CS_HREDRAW | CS_VREDRAW;
-    wcex.lpfnWndProc = WndProc;
-    wcex.hInstance = hInstance;
-    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_TIROPA));
-    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_TIROPA);
-    wcex.lpszClassName = szWindowClass;
-    wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
+DWORD WINAPI HiloServidorTCP(LPVOID);
+DWORD WINAPI ProcesarConexionCliente(LPVOID);
+DWORD WINAPI EscucharRespuestasServidor(LPVOID);
+int TransmitirDatosRed(HWND, char*);
 
-    return RegisterClassExW(&wcex);
+int GenerarNumeroAleatorio();
+int GenerarPosicionBase();
+int SeleccionarPlataformaAleatoria();
+void EjecutarDisparo(HWND, HWND, HWND);
+void DibujarPersonajeJuego(HDC);
+void RenderizarProyectilLocal(HWND, HDC, HWND);
+void RenderizarProyectilesRemotos(HWND, HDC);
+BOOL ValidarEntradaNumerica(const wchar_t*);
+
+// Obtener nombre del jugador desde el campo de texto
+void ObtenerNombreJugadorActual() {
+    TCHAR bufferTexto[32];
+    GetWindowText(campoNombre, bufferTexto, 32);
+    WideCharToMultiByte(CP_UTF8, 0, bufferTexto, -1, nombreJugadorActual, 32, NULL, NULL);
+
+    if (strlen(nombreJugadorActual) == 0) {
+        strcpy_s(nombreJugadorActual, sizeof(nombreJugadorActual), "jugador1");
+    }
 }
 
-// Inicializa la instancia de la aplicación
-BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
-{
-    hInst = hInstance;
+// Generador de números aleatorios para posicionamiento de plataformas
+int GenerarNumeroAleatorio() {
+    return 300 + rand() % (500 - 300 + 1);
+}
 
-    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, ANCHO_VENTANA, ALTO_VENTANA, nullptr, nullptr, hInstance, nullptr);
+// Generador de posición base para plataformas
+int GenerarPosicionBase() {
+    return 0 + rand() % (240 - 0 + 1);
+}
 
-    if (!hWnd) {
+// Selector aleatorio de plataforma para el jugador
+int SeleccionarPlataformaAleatoria() {
+    return (rand() % 3) + 1;
+}
+
+// Validador de entrada numérica en campos de texto
+BOOL ValidarEntradaNumerica(const wchar_t* textoEntrada) {
+    BOOL tienePuntoDecimal = FALSE;
+    BOOL tieneDigitos = FALSE;
+
+    while (iswspace(*textoEntrada)) textoEntrada++;
+    if (*textoEntrada == L'+' || *textoEntrada == L'-') textoEntrada++;
+
+    while (*textoEntrada) {
+        if (iswdigit(*textoEntrada)) {
+            tieneDigitos = TRUE;
+        }
+        else if (*textoEntrada == L'.') {
+            if (tienePuntoDecimal) return FALSE;
+            tienePuntoDecimal = TRUE;
+        }
+        else if (iswspace(*textoEntrada)) {
+            break;
+        }
+        else {
+            return FALSE;
+        }
+        textoEntrada++;
+    }
+    return tieneDigitos;
+}
+
+// Cliente TCP para transmisión de datos del proyectil
+int TransmitirDatosRed(HWND campoIP, char* nombreUsuario) {
+    WSADATA datosWinsock;
+    SOCKET socketConexion = INVALID_SOCKET;
+    struct addrinfo* resultadoDNS = NULL, * punteroAddr = NULL, configuracionAddr;
+    int resultadoOperacion;
+
+    TCHAR textoIP[16];
+    char direccionIP[16];
+    int longitudTexto = 0;
+
+    GetWindowText(campoIP, textoIP, 16);
+    longitudTexto = GetWindowTextLength(campoIP);
+    wcstombs(direccionIP, textoIP, longitudTexto);
+    direccionIP[longitudTexto] = '\0';
+
+    resultadoOperacion = WSAStartup(MAKEWORD(2, 2), &datosWinsock);
+    if (resultadoOperacion != 0) return 1;
+
+    ZeroMemory(&configuracionAddr, sizeof(configuracionAddr));
+    configuracionAddr.ai_family = AF_UNSPEC;
+    configuracionAddr.ai_socktype = SOCK_STREAM;
+    configuracionAddr.ai_protocol = IPPROTO_TCP;
+
+    resultadoOperacion = getaddrinfo(direccionIP, PUERTO_RED, &configuracionAddr, &resultadoDNS);
+    if (resultadoOperacion != 0) {
+        WSACleanup();
+        return 1;
+    }
+
+    for (punteroAddr = resultadoDNS; punteroAddr != NULL; punteroAddr = punteroAddr->ai_next) {
+        socketConexion = socket(punteroAddr->ai_family, punteroAddr->ai_socktype, punteroAddr->ai_protocol);
+        if (socketConexion == INVALID_SOCKET) {
+            WSACleanup();
+            return 1;
+        }
+
+        resultadoOperacion = connect(socketConexion, punteroAddr->ai_addr, (int)punteroAddr->ai_addrlen);
+        if (resultadoOperacion == SOCKET_ERROR) {
+            closesocket(socketConexion);
+            socketConexion = INVALID_SOCKET;
+            continue;
+        }
+        break;
+    }
+
+    freeaddrinfo(resultadoDNS);
+
+    if (socketConexion == INVALID_SOCKET) {
+        WSACleanup();
+        return 1;
+    }
+
+    // Agregar timestamp único al proyectil
+    datosEnvio.timestampCreacion = GetTickCount();
+
+    resultadoOperacion = send(socketConexion, (char*)&datosEnvio, sizeof(DATOS_RED), 0);
+    if (resultadoOperacion == SOCKET_ERROR) {
+        closesocket(socketConexion);
+        WSACleanup();
+        return 1;
+    }
+
+    // Crear hilo para recibir respuestas del servidor
+    SOCKET* punteroSocket = (SOCKET*)malloc(sizeof(SOCKET));
+    if (punteroSocket == NULL) {
+        closesocket(socketConexion);
+        return 1;
+    }
+    *punteroSocket = socketConexion;
+
+    HANDLE hiloRespuesta = CreateThread(NULL, 0, EscucharRespuestasServidor, punteroSocket, 0, NULL);
+    if (hiloRespuesta == NULL) {
+        closesocket(socketConexion);
+        free(punteroSocket);
+        return 1;
+    }
+
+    return 0;
+}
+
+// Hilo para recibir respuestas del servidor remoto
+DWORD WINAPI EscucharRespuestasServidor(LPVOID parametroSocket) {
+    SOCKET socketConexion = *((SOCKET*)parametroSocket);
+    int bytesRecibidos;
+    char bufferRespuesta[64];
+
+    do {
+        bytesRecibidos = recv(socketConexion, bufferRespuesta, (64 * sizeof(char)), 0);
+        if (bytesRecibidos > 0) {
+            bufferRespuesta[bytesRecibidos - 1] = '\0';
+
+            wchar_t textoUnicode[64];
+            mbstowcs(textoUnicode, bufferRespuesta, 64);
+
+            if (strstr(bufferRespuesta, "Impacto con personaje") != NULL) {
+                MessageBox(NULL, L"¡Eliminaste al objetivo!", L"¡Victoria!", MB_OK | MB_ICONEXCLAMATION);
+            }
+            else {
+                MessageBox(NULL, textoUnicode, L"Resultado del disparo", MB_OK | MB_ICONINFORMATION);
+            }
+
+            EnableWindow(botonDisparar, TRUE);
+            disparoTransmitido = FALSE;
+        }
+        else if (bytesRecibidos == 0) {
+            break;
+        }
+        else {
+            break;
+        }
+    } while (bytesRecibidos > 0);
+
+    shutdown(socketConexion, SD_SEND);
+    closesocket(socketConexion);
+    free(parametroSocket);
+    return 0;
+}
+
+// Servidor TCP principal para recibir proyectiles remotos (mejorado para múltiples conexiones)
+DWORD WINAPI HiloServidorTCP(LPVOID parametrosDatos) {
+    WSADATA datosWinsock;
+    int resultadoOperacion;
+    SOCKET socketEscucha = INVALID_SOCKET;
+    SOCKET socketCliente = INVALID_SOCKET;
+    struct addrinfo* resultadoConfig = NULL;
+    struct addrinfo configuracionServidor;
+
+    resultadoOperacion = WSAStartup(MAKEWORD(2, 2), &datosWinsock);
+    if (resultadoOperacion != 0) return 1;
+
+    ZeroMemory(&configuracionServidor, sizeof(configuracionServidor));
+    configuracionServidor.ai_family = AF_INET;
+    configuracionServidor.ai_socktype = SOCK_STREAM;
+    configuracionServidor.ai_protocol = IPPROTO_TCP;
+    configuracionServidor.ai_flags = AI_PASSIVE;
+
+    resultadoOperacion = getaddrinfo(NULL, PUERTO_RED, &configuracionServidor, &resultadoConfig);
+    if (resultadoOperacion != 0) {
+        WSACleanup();
+        return 1;
+    }
+
+    socketEscucha = socket(resultadoConfig->ai_family, resultadoConfig->ai_socktype, resultadoConfig->ai_protocol);
+    if (socketEscucha == INVALID_SOCKET) {
+        freeaddrinfo(resultadoConfig);
+        WSACleanup();
+        return 1;
+    }
+
+    // Configurar socket para reutilización de dirección
+    int opcionReutilizar = 1;
+    setsockopt(socketEscucha, SOL_SOCKET, SO_REUSEADDR, (char*)&opcionReutilizar, sizeof(opcionReutilizar));
+
+    resultadoOperacion = bind(socketEscucha, resultadoConfig->ai_addr, (int)resultadoConfig->ai_addrlen);
+    if (resultadoOperacion == SOCKET_ERROR) {
+        freeaddrinfo(resultadoConfig);
+        closesocket(socketEscucha);
+        WSACleanup();
+        return 1;
+    }
+
+    freeaddrinfo(resultadoConfig);
+
+    // Aumentar la cola de conexiones pendientes
+    resultadoOperacion = listen(socketEscucha, MAX_CONEXIONES_SIMULTANEAS);
+    if (resultadoOperacion == SOCKET_ERROR) {
+        closesocket(socketEscucha);
+        WSACleanup();
+        return 1;
+    }
+
+    while (TRUE && !aplicacionTerminando) {
+        socketCliente = accept(socketEscucha, NULL, NULL);
+        if (socketCliente == INVALID_SOCKET) {
+            if (!aplicacionTerminando) {
+                continue;  // Continuar en lugar de terminar por un error
+            }
+            break;
+        }
+
+        // Verificar límite de conexiones simultáneas
+        WaitForSingleObject(mutexContadores, INFINITE);
+        if (contadorConexionesActivas >= MAX_CONEXIONES_SIMULTANEAS) {
+            ReleaseMutex(mutexContadores);
+            closesocket(socketCliente);
+            continue;
+        }
+        contadorConexionesActivas++;
+        ReleaseMutex(mutexContadores);
+
+        SOCKET* punteroCliente = (SOCKET*)malloc(sizeof(SOCKET));
+        if (punteroCliente == NULL) {
+            closesocket(socketCliente);
+            WaitForSingleObject(mutexContadores, INFINITE);
+            contadorConexionesActivas--;
+            ReleaseMutex(mutexContadores);
+            continue;
+        }
+        *punteroCliente = socketCliente;
+
+        HANDLE hiloCliente = CreateThread(NULL, 0, ProcesarConexionCliente, punteroCliente, 0, NULL);
+        if (hiloCliente == NULL) {
+            closesocket(socketCliente);
+            free(punteroCliente);
+            WaitForSingleObject(mutexContadores, INFINITE);
+            contadorConexionesActivas--;
+            ReleaseMutex(mutexContadores);
+            continue;
+        }
+
+        CloseHandle(hiloCliente);
+    }
+
+    closesocket(socketCliente);
+    closesocket(socketEscucha);
+    WSACleanup();
+    return 1;
+}
+
+// Procesamiento de conexiones de clientes remotos (mejorado para múltiples proyectiles)
+DWORD WINAPI ProcesarConexionCliente(LPVOID parametroSocket) {
+    SOCKET socketCliente = *((SOCKET*)parametroSocket);
+    int bytesRecibidos;
+    DATOS_RED datosRecibidosLocal;
+
+    do {
+        bytesRecibidos = recv(socketCliente, (char*)&datosRecibidosLocal, sizeof(DATOS_RED), 0);
+
+        if (bytesRecibidos > 0) {
+            // Verificar límite de proyectiles simultáneos
+            WaitForSingleObject(mutexContadores, INFINITE);
+            if (contadorProyectilesRemotos >= MAX_PROYECTILES_SIMULTANEOS) {
+                ReleaseMutex(mutexContadores);
+                char mensajeLimite[] = "Servidor saturado - demasiados proyectiles";
+                send(socketCliente, mensajeLimite, strlen(mensajeLimite) + 1, 0);
+                break;
+            }
+            ReleaseMutex(mutexContadores);
+
+            WaitForSingleObject(mutexSincronizacion, INFINITE);
+
+            // Verificar si el proyectil ya existe (evitar duplicados)
+            DWORD idUnico = GenerarIDUnico();
+            if (!ProyectilYaExiste(idUnico, datosRecibidosLocal.timestampCreacion)) {
+                // Crear nuevo proyectil remoto con datos recibidos
+                ProyectilJuego* nuevoProyectil = (ProyectilJuego*)malloc(sizeof(ProyectilJuego));
+                if (nuevoProyectil != NULL) {
+                    nuevoProyectil->posicionInicialX = datosRecibidosLocal.x + ((datosRecibidosLocal.velocidadTotal * cos(datosRecibidosLocal.anguloRadianes)) * datosRecibidosLocal.tiempoTranscurrido);
+                    nuevoProyectil->posicionInicialY = datosRecibidosLocal.y + ((datosRecibidosLocal.velocidadTotal * sin(datosRecibidosLocal.anguloRadianes)) * datosRecibidosLocal.tiempoTranscurrido - FUERZA_GRAVEDAD * datosRecibidosLocal.tiempoTranscurrido * datosRecibidosLocal.tiempoTranscurrido * DELTA_TIEMPO);
+                    nuevoProyectil->velocidadMovimientoX = -(datosRecibidosLocal.velocidadTotal * cos(datosRecibidosLocal.anguloRadianes));
+                    nuevoProyectil->velocidadMovimientoY = (datosRecibidosLocal.velocidadTotal * sin(datosRecibidosLocal.anguloRadianes));
+                    nuevoProyectil->tiempoVida = datosRecibidosLocal.tiempoTranscurrido;
+                    nuevoProyectil->socketConexion = socketCliente;
+                    nuevoProyectil->estaVisible = TRUE;
+                    nuevoProyectil->esLocal = FALSE;
+                    nuevoProyectil->idUnico = idUnico;
+                    nuevoProyectil->timestampCreacion = datosRecibidosLocal.timestampCreacion;
+                    nuevoProyectil->siguiente = listaProyectilesRemotos;
+                    nuevoProyectil->anterior = NULL;
+
+                    strncpy_s(nuevoProyectil->nombrePropietario, sizeof(nuevoProyectil->nombrePropietario), datosRecibidosLocal.nombreJugador, _TRUNCATE);
+
+                    if (listaProyectilesRemotos) listaProyectilesRemotos->anterior = nuevoProyectil;
+                    listaProyectilesRemotos = nuevoProyectil;
+
+                    contadorProyectilesRemotos++;
+
+                    if (!temporizadorActivo) {
+                        SetTimer(ventanaPrincipal, ID_TEMPORIZADOR, SLEEP_TIME, NULL);
+                        temporizadorActivo = TRUE;
+                    }
+                }
+            }
+
+            ReleaseMutex(mutexSincronizacion);
+        }
+        else if (bytesRecibidos == 0) {
+            break;
+        }
+        else {
+            break;
+        }
+
+    } while (bytesRecibidos > 0);
+
+    shutdown(socketCliente, SD_SEND);
+    closesocket(socketCliente);
+    free(parametroSocket);
+
+    // Decrementar contador de conexiones activas
+    WaitForSingleObject(mutexContadores, INFINITE);
+    contadorConexionesActivas--;
+    ReleaseMutex(mutexContadores);
+
+    return 0;
+}
+
+// Función principal de disparo con validación de datos
+void EjecutarDisparo(HWND ventana, HWND campoAng, HWND campoVel) {
+    wchar_t bufferEntrada[256];
+
+    GetWindowText(campoVel, bufferEntrada, sizeof(bufferEntrada) / sizeof(wchar_t));
+    if (!ValidarEntradaNumerica(bufferEntrada)) {
+        MessageBox(ventana, L"Ingresa un valor numérico válido para la velocidad.", L"Entrada inválida", MB_ICONERROR);
+        return;
+    }
+    calculosLocales.velocidadTotal = _wtof(bufferEntrada);
+
+    GetWindowText(campoAng, bufferEntrada, sizeof(bufferEntrada) / sizeof(wchar_t));
+    if (!ValidarEntradaNumerica(bufferEntrada)) {
+        MessageBox(ventana, L"Ingresa un valor numérico válido para el ángulo.", L"Entrada inválida", MB_ICONERROR);
+        return;
+    }
+    calculosLocales.anguloRadianes = _wtof(bufferEntrada);
+
+    ObtenerNombreJugadorActual();
+
+    // Convertir ángulo a radianes y calcular componentes de velocidad
+    calculosLocales.anguloRadianes = calculosLocales.anguloRadianes * PI / 180.0;
+    calculosLocales.velocidadX = calculosLocales.velocidadTotal * cos(calculosLocales.anguloRadianes);
+    calculosLocales.velocidadY = calculosLocales.velocidadTotal * sin(calculosLocales.anguloRadianes);
+
+    WaitForSingleObject(mutexSincronizacion, INFINITE);
+
+    // Crear nuevo proyectil local
+    ProyectilJuego* nuevoDisparo = (ProyectilJuego*)malloc(sizeof(ProyectilJuego));
+    nuevoDisparo->posicionInicialX = 0.0;
+    nuevoDisparo->posicionInicialY = 0.0;
+    nuevoDisparo->velocidadMovimientoX = calculosLocales.velocidadX;
+    nuevoDisparo->velocidadMovimientoY = calculosLocales.velocidadY;
+    nuevoDisparo->velocidadLanzamiento = calculosLocales.velocidadTotal;
+    nuevoDisparo->tiempoVida = 0.0;
+    nuevoDisparo->anguloDisparo = calculosLocales.anguloRadianes;
+    nuevoDisparo->estaVisible = TRUE;
+    nuevoDisparo->esLocal = TRUE;
+    nuevoDisparo->idUnico = GenerarIDUnico();
+    nuevoDisparo->timestampCreacion = GetTickCount();
+    nuevoDisparo->siguiente = proyectilLocal;
+    nuevoDisparo->anterior = NULL;
+
+    strncpy_s(nuevoDisparo->nombrePropietario, sizeof(nuevoDisparo->nombrePropietario), nombreJugadorActual, _TRUNCATE);
+
+    if (proyectilLocal) proyectilLocal->anterior = nuevoDisparo;
+    proyectilLocal = nuevoDisparo;
+
+    disparoTransmitido = FALSE;
+
+    ReleaseMutex(mutexSincronizacion);
+
+    EnableWindow(botonDisparar, FALSE);
+    SetTimer(ventanaPrincipal, ID_TEMPORIZADOR, SLEEP_TIME, NULL);
+    temporizadorActivo = TRUE;
+}
+
+// Renderizado del proyectil local con física parabólica
+void RenderizarProyectilLocal(HWND ventana, HDC contextoGrafico, HWND botonControl) {
+    if (proyectilLocal == NULL || !proyectilLocal->estaVisible) return;
+
+    // Calcular posición usando ecuaciones de movimiento parabólico
+    proyectilLocal->posicionInicialX = proyectilLocal->velocidadMovimientoX * proyectilLocal->tiempoVida;
+    proyectilLocal->posicionInicialY = proyectilLocal->velocidadMovimientoY * proyectilLocal->tiempoVida - DELTA_TIEMPO * FUERZA_GRAVEDAD * proyectilLocal->tiempoVida * proyectilLocal->tiempoVida;
+    proyectilLocal->tiempoVida += DELTA_TIEMPO;
+
+    int coordenadaX = posicionInicialX + (int)proyectilLocal->posicionInicialX;
+    int coordenadaY = posicionInicialY - (int)proyectilLocal->posicionInicialY;
+
+    // Renderizar proyectil si está visible
+    if (proyectilLocal->estaVisible) {
+        HDC contextoMemoria = CreateCompatibleDC(contextoGrafico);
+        HBITMAP bitmapAnterior = (HBITMAP)SelectObject(contextoMemoria, imagenProyectil);
+        GetObject(imagenProyectil, sizeof(informacionBitmap), &informacionBitmap);
+
+        anchoProyectil = 30;
+        altoProyectil = 30;
+
+        SetStretchBltMode(contextoGrafico, HALFTONE);
+        StretchBlt(contextoGrafico, coordenadaX, coordenadaY, anchoProyectil, altoProyectil,
+            contextoMemoria, 0, 0, informacionBitmap.bmWidth, informacionBitmap.bmHeight, SRCCOPY);
+
+        SelectObject(contextoMemoria, bitmapAnterior);
+        DeleteDC(contextoMemoria);
+    }
+
+    // Verificar límites de pantalla
+    if (coordenadaX < 0 || coordenadaY > 720 - altoProyectil) {
+        if (proyectilLocal == NULL && listaProyectilesRemotos == NULL) {
+            KillTimer(ventana, ID_TEMPORIZADOR);
+            temporizadorActivo = FALSE;
+        }
+
+        EnableWindow(botonControl, TRUE);
+
+        ProyectilJuego* proyectilEliminar = proyectilLocal;
+        proyectilLocal = proyectilLocal->siguiente;
+        if (proyectilEliminar->anterior) proyectilEliminar->anterior->siguiente = proyectilEliminar->siguiente;
+        if (proyectilEliminar->siguiente) proyectilEliminar->siguiente->anterior = proyectilEliminar->anterior;
+        if (proyectilEliminar == proyectilLocal) proyectilLocal = proyectilEliminar->siguiente;
+        free(proyectilEliminar);
+    }
+    else if (coordenadaX > 1080 && !disparoTransmitido) {
+        if (proyectilLocal == NULL && listaProyectilesRemotos == NULL) {
+            KillTimer(ventana, ID_TEMPORIZADOR);
+            temporizadorActivo = FALSE;
+        }
+        disparoTransmitido = TRUE;
+
+        // Preparar datos para transmisión de red
+        datosEnvio.x = coordenadaX;
+        datosEnvio.y = coordenadaY;
+        datosEnvio.tiempoTranscurrido = proyectilLocal->tiempoVida;
+        datosEnvio.velocidadTotal = proyectilLocal->velocidadLanzamiento;
+        datosEnvio.velocidadInicialX = posicionInicialX;
+        datosEnvio.velocidadInicialY = posicionInicialY;
+        datosEnvio.anguloRadianes = proyectilLocal->anguloDisparo;
+        datosEnvio.timestampCreacion = proyectilLocal->timestampCreacion;
+
+        strncpy_s(datosEnvio.nombreJugador, sizeof(datosEnvio.nombreJugador), nombreJugadorActual, _TRUNCATE);
+
+        TransmitirDatosRed(campoDireccionIP, proyectilLocal->nombrePropietario);
+
+        ProyectilJuego* proyectilEliminar = proyectilLocal;
+        proyectilLocal = proyectilLocal->siguiente;
+        if (proyectilEliminar->anterior) proyectilEliminar->anterior->siguiente = proyectilEliminar->siguiente;
+        if (proyectilEliminar->siguiente) proyectilEliminar->siguiente->anterior = proyectilEliminar->anterior;
+        if (proyectilEliminar == proyectilLocal) proyectilLocal = proyectilEliminar->siguiente;
+        free(proyectilEliminar);
+    }
+}
+
+// Renderizado y detección de colisiones de proyectiles remotos (optimizado para múltiples proyectiles)
+void RenderizarProyectilesRemotos(HWND ventana, HDC contextoGrafico) {
+    HBITMAP bitmapAnterior;
+    ProyectilJuego* proyectilActual;
+    int proyectilesRenderizados = 0;
+
+    WaitForSingleObject(mutexSincronizacion, INFINITE);
+
+    proyectilActual = listaProyectilesRemotos;
+
+    while (proyectilActual != NULL && proyectilesRenderizados < MAX_PROYECTILES_SIMULTANEOS) {
+        if (!proyectilActual->estaVisible) {
+            proyectilActual = proyectilActual->siguiente;
+            continue;
+        }
+
+        // Calcular posición con física parabólica
+        float posicionPantallaX = proyectilActual->posicionInicialX + (proyectilActual->velocidadMovimientoX * proyectilActual->tiempoVida);
+        float posicionPantallaY = proyectilActual->posicionInicialY - (proyectilActual->velocidadMovimientoY * proyectilActual->tiempoVida - DELTA_TIEMPO * FUERZA_GRAVEDAD * proyectilActual->tiempoVida * proyectilActual->tiempoVida);
+        proyectilActual->tiempoVida += DELTA_TIEMPO;
+
+        // Renderizar proyectil remoto
+        HDC contextoMemoria = CreateCompatibleDC(contextoGrafico);
+        bitmapAnterior = (HBITMAP)SelectObject(contextoMemoria, imagenProyectil);
+        GetObject(imagenProyectil, sizeof(informacionBitmap), &informacionBitmap);
+
+        anchoProyectil = 30;
+        altoProyectil = 30;
+
+        SetStretchBltMode(contextoGrafico, HALFTONE);
+        StretchBlt(contextoGrafico, (int)posicionPantallaX, (int)posicionPantallaY, anchoProyectil, altoProyectil,
+            contextoMemoria, 0, 0, informacionBitmap.bmWidth, informacionBitmap.bmHeight, SRCCOPY);
+
+        SelectObject(contextoMemoria, bitmapAnterior);
+        DeleteDC(contextoMemoria);
+
+        proyectilesRenderizados++;
+        bool hayImpacto = false;
+
+        // Detección precisa de colisión con personaje usando IntersectRect
+        RECT rectanguloProyectil = {
+            (int)posicionPantallaX, (int)posicionPantallaY,
+            (int)posicionPantallaX + 30, (int)posicionPantallaY + 30
+        };
+
+        RECT rectanguloPersonaje = {
+            posicionJugador.x, posicionJugador.y,
+            posicionJugador.x + 40, posicionJugador.y + 50
+        };
+
+        RECT areaInterseccion;
+
+        if (IntersectRect(&areaInterseccion, &rectanguloProyectil, &rectanguloPersonaje)) {
+            hayImpacto = true;
+            proyectilActual->estaVisible = FALSE;
+
+            // Enviar confirmación de impacto al atacante
+            char mensajeRespuesta[] = "Impacto con personaje";
+            if (proyectilActual->socketConexion != INVALID_SOCKET) {
+                send(proyectilActual->socketConexion, mensajeRespuesta, strlen(mensajeRespuesta) + 1, 0);
+            }
+
+            // Mostrar mensaje de eliminación
+            char mensajeEliminacion[64];
+            sprintf_s(mensajeEliminacion, sizeof(mensajeEliminacion), "Fuiste eliminado por %s", proyectilActual->nombrePropietario);
+
+            wchar_t mensajeUnicode[64];
+            MultiByteToWideChar(CP_UTF8, 0, mensajeEliminacion, -1, mensajeUnicode, 64);
+
+            MessageBox(ventana, mensajeUnicode, L"¡Eliminado!", MB_OK | MB_ICONEXCLAMATION);
+
+            // Eliminar proyectil de la lista
+            ProyectilJuego* proyectilEliminar = proyectilActual;
+            proyectilActual = proyectilActual->siguiente;
+            if (proyectilEliminar->anterior) proyectilEliminar->anterior->siguiente = proyectilEliminar->siguiente;
+            if (proyectilEliminar->siguiente) proyectilEliminar->siguiente->anterior = proyectilEliminar->anterior;
+            if (proyectilEliminar == listaProyectilesRemotos) listaProyectilesRemotos = proyectilEliminar->siguiente;
+
+            if (proyectilEliminar->socketConexion != INVALID_SOCKET) {
+                closesocket(proyectilEliminar->socketConexion);
+            }
+            free(proyectilEliminar);
+            contadorProyectilesRemotos--;
+
+            ReleaseMutex(mutexSincronizacion);
+
+            TerminarJuegoCompleto();
+            return;
+        }
+
+        // Verificar colisiones con plataformas
+        if (!hayImpacto) {
+            for (int i = 0; i < 3; i++) {
+                if (!plataformaActiva[i]) continue;
+
+                RECT rectanguloPlataforma = {
+                    min(coordenadasPlataformas[i].x1, coordenadasPlataformas[i].x2),
+                    min(coordenadasPlataformas[i].y1, coordenadasPlataformas[i].y2),
+                    max(coordenadasPlataformas[i].x1, coordenadasPlataformas[i].x2),
+                    max(coordenadasPlataformas[i].y1, coordenadasPlataformas[i].y2)
+                };
+
+                RECT interseccionPlataforma;
+
+                if (IntersectRect(&interseccionPlataforma, &rectanguloProyectil, &rectanguloPlataforma)) {
+                    plataformaActiva[i] = false;
+                    hayImpacto = true;
+                    proyectilActual->estaVisible = FALSE;
+
+                    if (i == indicePlataformaJugador) {
+                        posicionJugador.y = 670;
+                        indicePlataformaJugador = -1;
+                        posicionInicialY = posicionJugador.y - 50;
+                    }
+
+                    InvalidateRect(ventana, NULL, TRUE);
+
+                    char mensajeObstaculo[] = "Impacto con obstaculo";
+                    if (proyectilActual->socketConexion != INVALID_SOCKET) {
+                        send(proyectilActual->socketConexion, mensajeObstaculo, strlen(mensajeObstaculo) + 1, 0);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Eliminar proyectil si hay impacto
+        if (hayImpacto) {
+            ProyectilJuego* proyectilEliminar = proyectilActual;
+            proyectilActual = proyectilActual->siguiente;
+            if (proyectilEliminar->anterior) proyectilEliminar->anterior->siguiente = proyectilEliminar->siguiente;
+            if (proyectilEliminar->siguiente) proyectilEliminar->siguiente->anterior = proyectilEliminar->anterior;
+            if (proyectilEliminar == listaProyectilesRemotos) listaProyectilesRemotos = proyectilEliminar->siguiente;
+
+            if (proyectilEliminar->socketConexion != INVALID_SOCKET) {
+                closesocket(proyectilEliminar->socketConexion);
+            }
+            free(proyectilEliminar);
+            contadorProyectilesRemotos--;
+            continue;
+        }
+
+        // Verificar límites de pantalla
+        if (posicionPantallaX < 0 || posicionPantallaY > 720 - altoProyectil) {
+            InvalidateRect(ventana, NULL, TRUE);
+
+            char mensajeLimite[] = "Proyectil salio de pantalla";
+            if (proyectilActual->socketConexion != INVALID_SOCKET) {
+                send(proyectilActual->socketConexion, mensajeLimite, strlen(mensajeLimite) + 1, 0);
+            }
+
+            ProyectilJuego* proyectilEliminar = proyectilActual;
+            proyectilActual = proyectilActual->siguiente;
+            if (proyectilEliminar->anterior) proyectilEliminar->anterior->siguiente = proyectilEliminar->siguiente;
+            if (proyectilEliminar->siguiente) proyectilEliminar->siguiente->anterior = proyectilEliminar->anterior;
+            if (proyectilEliminar == listaProyectilesRemotos) listaProyectilesRemotos = proyectilEliminar->siguiente;
+
+            if (proyectilEliminar->socketConexion != INVALID_SOCKET) {
+                closesocket(proyectilEliminar->socketConexion);
+            }
+            free(proyectilEliminar);
+            contadorProyectilesRemotos--;
+            continue;
+        }
+
+        proyectilActual = proyectilActual->siguiente;
+    }
+
+    // Limpiar proyectiles inactivos periódicamente
+    static DWORD ultimaLimpieza = 0;
+    DWORD tiempoActual = GetTickCount();
+    if (tiempoActual - ultimaLimpieza > 5000) {  // Limpiar cada 5 segundos
+        ultimaLimpieza = tiempoActual;
+        // La limpieza se hará después de liberar el mutex
+    }
+
+    if (proyectilLocal == NULL && listaProyectilesRemotos == NULL) {
+        KillTimer(ventana, ID_TEMPORIZADOR);
+        temporizadorActivo = FALSE;
+    }
+
+    ReleaseMutex(mutexSincronizacion);
+
+    // Limpiar proyectiles inactivos si es necesario
+    if (tiempoActual - ultimaLimpieza == 0) {
+        LimpiarProyectilesInactivos();
+    }
+}
+
+// Renderizado del personaje del jugador
+void DibujarPersonajeJuego(HDC contextoGrafico) {
+    HDC contextoMemoria = CreateCompatibleDC(contextoGrafico);
+    HBITMAP bitmapAnterior = (HBITMAP)SelectObject(contextoMemoria, imagenPersonaje);
+    GetObject(imagenPersonaje, sizeof(informacionBitmap), &informacionBitmap);
+
+    int anchoPersonaje = 40;
+    int altoPersonaje = 50;
+
+    SetStretchBltMode(contextoGrafico, HALFTONE);
+    StretchBlt(contextoGrafico, posicionJugador.x, posicionJugador.y, anchoPersonaje, altoPersonaje,
+        contextoMemoria, 0, 0, informacionBitmap.bmWidth, informacionBitmap.bmHeight, SRCCOPY);
+
+    SelectObject(contextoMemoria, bitmapAnterior);
+    DeleteDC(contextoMemoria);
+}
+
+// Punto de entrada principal de la aplicación
+int APIENTRY wWinMain(_In_ HINSTANCE instancia, _In_opt_ HINSTANCE instanciaAnterior,
+    _In_ LPWSTR lineaComandos, _In_ int modoMostrar) {
+    UNREFERENCED_PARAMETER(instanciaAnterior);
+    UNREFERENCED_PARAMETER(lineaComandos);
+
+    srand((unsigned int)time(NULL));
+
+    LoadStringW(instancia, IDS_APP_TITLE, tituloVentana, MAX_CADENA);
+    LoadStringW(instancia, IDC_TIROPA, claseVentana, MAX_CADENA);
+    RegistrarClaseVentana(instancia);
+
+    if (!InicializarInstancia(instancia, modoMostrar)) {
         return FALSE;
     }
 
-    hWndGlobal = hWnd;
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
+    HACCEL tablaAceleradores = LoadAccelerators(instancia, MAKEINTRESOURCE(IDC_TIROPA));
+    MSG mensaje;
 
+    while (GetMessage(&mensaje, nullptr, 0, 0)) {
+        if (!TranslateAccelerator(mensaje.hwnd, tablaAceleradores, &mensaje)) {
+            TranslateMessage(&mensaje);
+            DispatchMessage(&mensaje);
+        }
+    }
+
+    return (int)mensaje.wParam;
+}
+
+// Registro de la clase de ventana
+ATOM RegistrarClaseVentana(HINSTANCE instancia) {
+    WNDCLASSEXW configuracionClase;
+    configuracionClase.cbSize = sizeof(WNDCLASSEX);
+    configuracionClase.style = CS_HREDRAW | CS_VREDRAW;
+    configuracionClase.lpfnWndProc = ProcedimientoVentana;
+    configuracionClase.cbClsExtra = 0;
+    configuracionClase.cbWndExtra = 0;
+    configuracionClase.hInstance = instancia;
+    configuracionClase.hIcon = LoadIcon(instancia, MAKEINTRESOURCE(IDI_TIROPA));
+    configuracionClase.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    configuracionClase.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    configuracionClase.lpszMenuName = MAKEINTRESOURCEW(IDC_TIROPA);
+    configuracionClase.lpszClassName = claseVentana;
+    configuracionClase.hIconSm = LoadIcon(configuracionClase.hInstance, MAKEINTRESOURCE(IDI_SMALL));
+    return RegisterClassExW(&configuracionClase);
+}
+
+// Inicialización de la instancia de la aplicación
+BOOL InicializarInstancia(HINSTANCE instancia, int modoMostrar) {
+    instanciaApp = instancia;
+
+    RECT rectanguloVentana = { 0, 0, 1080, 720 };
+    AdjustWindowRect(&rectanguloVentana, WS_OVERLAPPEDWINDOW, TRUE);
+
+    anchoVentana = rectanguloVentana.right - rectanguloVentana.left;
+    altoVentana = rectanguloVentana.bottom - rectanguloVentana.top;
+
+    ventanaPrincipal = CreateWindowW(claseVentana, tituloVentana, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, anchoVentana, altoVentana, nullptr, nullptr, instancia, nullptr);
+
+    if (!ventanaPrincipal) {
+        return FALSE;
+    }
+
+    ShowWindow(ventanaPrincipal, modoMostrar);
+    UpdateWindow(ventanaPrincipal);
     return TRUE;
 }
 
-// Procedimiento de ventana principal
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
-{
-    switch (message)
-    {
+// Procedimiento principal de la ventana (manejo de mensajes)
+LRESULT CALLBACK ProcedimientoVentana(HWND ventana, UINT mensaje, WPARAM wParam, LPARAM lParam) {
+    static HANDLE hiloServidor;
+    static DWORD idHiloServidor;
+
+    switch (mensaje) {
     case WM_TIMER:
-        if (wParam == 1 && !aplicacionCerrando) {
-            ActualizarProyectiles();
-            InvalidateRect(hWnd, &gameArea, FALSE);
+        if (wParam == ID_TEMPORIZADOR) {
+            InvalidateRect(ventana, NULL, FALSE);
         }
         break;
 
     case WM_CREATE:
-        // Crear controles de interfaz
-        CreateWindowW(L"STATIC", L"Nombre:", WS_CHILD | WS_VISIBLE,
-            20, 15, 60, 20, hWnd, NULL, hInst, NULL);
-        hEditNombre = CreateWindowW(L"EDIT", L"jugador1", WS_CHILD | WS_VISIBLE | WS_BORDER,
-            85, 13, 100, 25, hWnd, NULL, hInst, NULL);
-
-        CreateWindowW(L"STATIC", L"Velocidad:", WS_CHILD | WS_VISIBLE,
-            200, 15, 80, 20, hWnd, NULL, hInst, NULL);
-        hEditVelocidad = CreateWindowW(L"EDIT", L"50", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
-            285, 13, 60, 25, hWnd, NULL, hInst, NULL);
-
-        CreateWindowW(L"STATIC", L"Ángulo:", WS_CHILD | WS_VISIBLE,
-            360, 15, 60, 20, hWnd, NULL, hInst, NULL);
-        hEditAngulo = CreateWindowW(L"EDIT", L"45", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER,
-            420, 13, 60, 25, hWnd, NULL, hInst, NULL);
-
-        CreateWindowW(L"STATIC", L"IP:", WS_CHILD | WS_VISIBLE,
-            495, 15, 30, 20, hWnd, NULL, hInst, NULL);
-        hEditIP = CreateWindowW(L"EDIT", L"127.0.0.1", WS_CHILD | WS_VISIBLE | WS_BORDER,
-            525, 13, 120, 25, hWnd, NULL, hInst, NULL);
-
-        hBtnDisparar = CreateWindowW(L"BUTTON", L"Disparar", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-            660, 13, 80, 30, hWnd, (HMENU)1, hInst, NULL);
-
-        InicializarJuego(hWnd);
-        break;
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam))
-        {
-        case 1: // Botón disparar
-        {
-            if (personaje_destruido) {
-                MessageBox(hWnd, L"Personaje destruido. Reinicia el juego.", L"No se puede disparar", MB_OK | MB_ICONINFORMATION);
-                break;
-            }
-
-            if (tiro_en_progreso) {
-                MessageBox(hWnd, L"Ya hay un tiro en progreso. Espera a que termine.", L"Tiro en progreso", MB_OK | MB_ICONWARNING);
-                break;
-            }
-
-            if (!ValidarDatosEntrada()) {
-                break;
-            }
-
-            // Obtener datos del usuario
-            TCHAR bufferNombre[MAX_ALIAS];
-            GetWindowText(hEditNombre, bufferNombre, MAX_ALIAS);
-            WideCharToMultiByte(CP_UTF8, 0, bufferNombre, -1, alias_jugador, MAX_ALIAS, NULL, NULL);
-
-            TCHAR bufferVel[16], bufferAng[16];
-            GetWindowText(hEditVelocidad, bufferVel, 16);
-            GetWindowText(hEditAngulo, bufferAng, 16);
-
-            double vel = _wtof(bufferVel);
-            double angRad = _wtof(bufferAng) * M_PI / 180.0;
-
-            // Crear proyectil desde el centro del personaje
-            CrearProyectil(personaje_x + ANCHO_PERSONAJE / 2, personaje_y + ALTO_PERSONAJE / 2,
-                vel, angRad, TRUE, alias_jugador);
-
-            tiro_en_progreso = TRUE;
-            EnableWindow(hBtnDisparar, FALSE);
-            break;
-        }
-        default:
-            return DefWindowProc(hWnd, message, wParam, lParam);
-        }
-        break;
-
-    case WM_PAINT:
     {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
+        int indice = 0;
+        int coordenadaX1 = GenerarPosicionBase();
+        int coordenadaX2 = coordenadaX1 + 70;
 
-        // Solo redibujar si es necesario
-        if (ps.rcPaint.left < gameArea.right && ps.rcPaint.right > gameArea.left &&
-            ps.rcPaint.top < gameArea.bottom && ps.rcPaint.bottom > gameArea.top) {
+        // Crear interfaz de usuario en línea horizontal
+        int posicionY = 15;
+        int inicioX = 10;
 
-            DibujarJuego(hMemDC);
-            BitBlt(hdc, gameArea.left, gameArea.top, ANCHO_JUEGO, ALTO_JUEGO,
-                hMemDC, 0, 0, SRCCOPY);
+        CreateWindowW(L"STATIC", L"Nombre:", WS_CHILD | WS_VISIBLE,
+            inicioX, posicionY, 50, 20, ventana, NULL, instanciaApp, NULL);
+        campoNombre = CreateWindowW(L"EDIT", L"jugador1", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            inicioX + 55, posicionY - 2, 80, 25, ventana, (HMENU)ID_CAMPO_NOMBRE_JUGADOR, instanciaApp, NULL);
+
+        inicioX += 150;
+        CreateWindowW(L"STATIC", L"Vel:", WS_CHILD | WS_VISIBLE,
+            inicioX, posicionY, 30, 20, ventana, NULL, instanciaApp, NULL);
+        campoVelocidad = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            inicioX + 35, posicionY - 2, 60, 25, ventana, (HMENU)ID_CAMPO_VELOCIDAD, instanciaApp, NULL);
+
+        inicioX += 110;
+        CreateWindowW(L"STATIC", L"Ang:", WS_CHILD | WS_VISIBLE,
+            inicioX, posicionY, 30, 20, ventana, NULL, instanciaApp, NULL);
+        campoAngulo = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            inicioX + 35, posicionY - 2, 60, 25, ventana, (HMENU)ID_CAMPO_ANGULO, instanciaApp, NULL);
+
+        inicioX += 110;
+        CreateWindowW(L"STATIC", L"IP:", WS_CHILD | WS_VISIBLE,
+            inicioX, posicionY, 20, 20, ventana, NULL, instanciaApp, NULL);
+        campoDireccionIP = CreateWindowW(L"EDIT", L"127.0.0.1", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            inicioX + 25, posicionY - 2, 100, 25, ventana, (HMENU)ID_CAMPO_DIRECCION_IP, instanciaApp, NULL);
+
+        inicioX += 140;
+        botonDisparar = CreateWindowW(L"BUTTON", L"DISPARAR", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+            inicioX, posicionY - 5, 90, 35, ventana, (HMENU)ID_BOTON_DISPARAR, instanciaApp, NULL);
+
+        // Cargar recursos gráficos
+        imagenProyectil = LoadBitmap(GetModuleHandle(NULL), MAKEINTRESOURCE(IDB_COMER));
+        imagenPersonaje = LoadBitmap(GetModuleHandle(NULL), MAKEINTRESOURCE(IDB_PERSONAJE));
+
+        if (imagenProyectil == NULL || imagenPersonaje == NULL) {
+            MessageBox(ventana, L"Error al cargar las imágenes del juego", L"Error", MB_OK | MB_ICONERROR);
         }
 
-        EndPaint(hWnd, &ps);
+        // Inicializar mutexes de sincronización
+        mutexSincronizacion = CreateMutex(NULL, FALSE, NULL);
+        mutexContadores = CreateMutex(NULL, FALSE, NULL);
+        if (mutexSincronizacion == NULL || mutexContadores == NULL) {
+            MessageBox(ventana, L"Error al crear los mutex de sincronización", L"Error", MB_OK | MB_ICONERROR);
+        }
+
+        int plataformaSeleccionada = SeleccionarPlataformaAleatoria();
+
+        // Configurar coordenadas de plataformas y posición del jugador
+        for (indice = 0; indice < 3; indice++) {
+            coordenadasPlataformas[indice].x1 = coordenadaX1;
+            coordenadasPlataformas[indice].x2 = coordenadaX2;
+            coordenadasPlataformas[indice].y1 = 720;
+            coordenadasPlataformas[indice].y2 = GenerarNumeroAleatorio();
+
+            if ((indice + 1) == plataformaSeleccionada) {
+                posicionJugador.x = coordenadaX1 + 15;
+                posicionJugador.y = coordenadasPlataformas[indice].y2 - 50;
+                indicePlataformaJugador = indice;
+            }
+
+            coordenadaX1 = coordenadaX1 + 70;
+            coordenadaX2 = coordenadaX2 + 70;
+        }
+
+        posicionInicialX = posicionJugador.x + 17;
+        posicionInicialY = posicionJugador.y - 50;
+
+        // Iniciar servidor TCP en hilo separado
+        hiloServidor = CreateThread(NULL, 0, HiloServidorTCP, (LPVOID)&datosRecepcion, 0, &idHiloServidor);
+        if (hiloServidor == NULL) {
+            MessageBox(ventana, L"Error al crear el hilo del servidor", L"Error", MB_OK | MB_ICONERROR);
+        }
     }
     break;
 
-    case WM_CLOSE:
-        CerrarAplicacion();
-        break;
+    case WM_COMMAND:
+    {
+        int identificadorComando = LOWORD(wParam);
+        switch (identificadorComando) {
+        case ID_BOTON_DISPARAR:
+            EjecutarDisparo(ventana, campoAngulo, campoVelocidad);
+            break;
+        case IDM_ABOUT:
+            DialogBox(instanciaApp, MAKEINTRESOURCE(IDD_ABOUTBOX), ventana, AcercaDe);
+            break;
+        case IDM_EXIT:
+            TerminarJuegoCompleto();
+            break;
+        default:
+            return DefWindowProc(ventana, mensaje, wParam, lParam);
+        }
+    }
+    break;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT estructuraPintado;
+        HDC contextoDispositivo = BeginPaint(ventana, &estructuraPintado);
+
+        RECT rectanguloCliente;
+        GetClientRect(ventana, &rectanguloCliente);
+        int anchoAreaCliente = rectanguloCliente.right;
+        int altoAreaCliente = rectanguloCliente.bottom;
+
+        // Crear buffer de doble renderizado
+        HDC contextoMemoria = CreateCompatibleDC(contextoDispositivo);
+        HBITMAP bitmapMemoria = CreateCompatibleBitmap(contextoDispositivo, anchoAreaCliente, altoAreaCliente);
+        HBITMAP bitmapAnterior = (HBITMAP)SelectObject(contextoMemoria, bitmapMemoria);
+
+        FillRect(contextoMemoria, &rectanguloCliente, (HBRUSH)(COLOR_WINDOW + 1));
+
+        // Renderizar plataformas con gradiente vertical
+        for (int i = 0; i < 3; i++) {
+            if (!plataformaActiva[i]) continue;
+
+            RECT rectanguloPlataforma = {
+                coordenadasPlataformas[i].x1, coordenadasPlataformas[i].y2,
+                coordenadasPlataformas[i].x2, coordenadasPlataformas[i].y1
+            };
+
+            TRIVERTEX verticesGradiente[2];
+            verticesGradiente[0].x = rectanguloPlataforma.left;
+            verticesGradiente[0].y = rectanguloPlataforma.top;
+            verticesGradiente[0].Red = 0x4000;
+            verticesGradiente[0].Green = 0x8000;
+            verticesGradiente[0].Blue = 0xff00;
+            verticesGradiente[0].Alpha = 0x0000;
+
+            verticesGradiente[1].x = rectanguloPlataforma.right;
+            verticesGradiente[1].y = rectanguloPlataforma.bottom;
+            verticesGradiente[1].Red = 0x8000;
+            verticesGradiente[1].Green = 0x0000;
+            verticesGradiente[1].Blue = 0xff00;
+            verticesGradiente[1].Alpha = 0x0000;
+
+            GRADIENT_RECT rectanguloGradiente;
+            rectanguloGradiente.UpperLeft = 0;
+            rectanguloGradiente.LowerRight = 1;
+
+            GradientFill(contextoMemoria, verticesGradiente, 2, &rectanguloGradiente, 1, GRADIENT_FILL_RECT_V);
+        }
+
+        DibujarPersonajeJuego(contextoMemoria);
+        RenderizarProyectilLocal(ventana, contextoMemoria, botonDisparar);
+        RenderizarProyectilesRemotos(ventana, contextoMemoria);
+
+        // Mostrar información de estado en la esquina superior derecha
+        //char infoEstado[100];
+        //sprintf_s(infoEstado, sizeof(infoEstado), "Proyectiles: %d | Conexiones: %d", contadorProyectilesRemotos, contadorConexionesActivas);
+
+        //wchar_t infoUnicode[100];
+        //MultiByteToWideChar(CP_UTF8, 0, infoEstado, -1, infoUnicode, 100);
+
+        //SetTextColor(contextoMemoria, RGB(255, 0, 0));
+        //SetBkMode(contextoMemoria, TRANSPARENT);
+        //TextOut(contextoMemoria, anchoAreaCliente - 250, 50, infoUnicode, wcslen(infoUnicode));
+
+        // Copiar buffer a pantalla
+        BitBlt(contextoDispositivo, 0, 0, anchoAreaCliente, altoAreaCliente, contextoMemoria, 0, 0, SRCCOPY);
+
+        SelectObject(contextoMemoria, bitmapAnterior);
+        DeleteObject(bitmapMemoria);
+        DeleteDC(contextoMemoria);
+
+        EndPaint(ventana, &estructuraPintado);
+    }
+    break;
 
     case WM_DESTROY:
+        TerminarJuegoCompleto();
         break;
 
     default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+        return DefWindowProc(ventana, mensaje, wParam, lParam);
     }
     return 0;
 }
 
 // Diálogo "Acerca de"
-INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
-{
+INT_PTR CALLBACK AcercaDe(HWND dialogo, UINT mensaje, WPARAM wParam, LPARAM lParam) {
     UNREFERENCED_PARAMETER(lParam);
-    switch (message)
-    {
+    switch (mensaje) {
     case WM_INITDIALOG:
         return (INT_PTR)TRUE;
-
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
-        {
-            EndDialog(hDlg, LOWORD(wParam));
-            return (INT_PTR)TRUE;
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dialogo, LOWORD(wParam));
+            if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+                EndDialog(dialogo, LOWORD(wParam));
+                return (INT_PTR)TRUE;
+            }
+            break;
         }
-        break;
+        return (INT_PTR)FALSE;
     }
-    return (INT_PTR)FALSE;
 }

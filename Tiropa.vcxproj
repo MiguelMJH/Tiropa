@@ -133,7 +133,9 @@
     <ClInclude Include="Tiropa.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="Tiropa.cpp" />
+    <ClCompile Include="Tiropa.cpp">
+      <DisableSpecificWarnings Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">4996</DisableSpecificWarnings>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Tiropa.rc" />
