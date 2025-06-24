@@ -1,6 +1,5 @@
 /**
  * Compilar: gcc -o tiropa tiropa.c `pkg-config --cflags --libs gtk+-3.0` -lm -lpthread -export-dynamic
- * VERSIÓN MEJORADA CON SOPORTE PARA MÚLTIPLES PROYECTILES SIMULTÁNEOS
  */
 #include <gtk/gtk.h>
 #include <cairo.h>
